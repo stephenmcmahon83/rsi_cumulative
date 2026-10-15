@@ -12,7 +12,7 @@ st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
 st.title("Cumulative RSI(2) Quantitative Edge Platform")
 st.caption(
     "Parametric Multi-Day Smoothed RSI(2) Engine | Real-Time Ticker Watchlist Analyzer | "
-    "Dynamic Snapback Exits (SMA5, RSI70) | 200-Day Trend Filtering | MAE Drawdown Tracking."
+    "Dynamic Snapback Exits (SMA5, RSI70) | Profit Factor & Average MAE Pain Analytics."
 )
 
 # ==========================================
@@ -64,11 +64,16 @@ def prepare_stock_data(df):
     df['Fwd_10d'] = (close_s.shift(-10) - close_s) / close_s * 100
     df['Fwd_15d'] = (close_s.shift(-15) - close_s) / close_s * 100
     
-    # 5. Maximum Adverse Excursion (MAE)
+    # 5. True Maximum Adverse Excursion (MAE)
     min_low_5d = low_s.iloc[::-1].rolling(5).min().shift(1).iloc[::-1]
     min_low_10d = low_s.iloc[::-1].rolling(10).min().shift(1).iloc[::-1]
-    df['MAE_5d'] = (min_low_5d - close_s) / close_s * 100
-    df['MAE_10d'] = (min_low_10d - close_s) / close_s * 100
+    
+    raw_mae_5d = (min_low_5d - close_s) / close_s * 100
+    raw_mae_10d = (min_low_10d - close_s) / close_s * 100
+    
+    # Drawdown cannot be positive: if price never traded below entry close, MAE is 0.0%
+    df['MAE_5d'] = raw_mae_5d.clip(upper=0.0)
+    df['MAE_10d'] = raw_mae_10d.clip(upper=0.0)
     
     # 6. Dynamic Snapback Exits
     n = len(df)
@@ -121,7 +126,7 @@ def prepare_stock_data(df):
     return df
 
 def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require_uptrend=False):
-    """Aggregates win rate, return distributions, MAE, and dynamic snapback exits by bucket."""
+    """Aggregates win rate, return distributions, average MAE, and profit factor by bucket."""
     data = df.dropna(subset=[bucket_col, 'Fwd_5d', 'Fwd_10d', 'Fwd_15d']).copy()
     
     if require_uptrend:
@@ -139,45 +144,57 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require
         if n == 0:
             records.append({
                 "RSI Bucket": b, "Signals": 0,
-                "5D Win Rate (%)": 0.0, "5D Avg Ret (%)": 0.0, "5D Med Drawdown (%)": 0.0,
-                "10D Win Rate (%)": 0.0, "10D Avg Ret (%)": 0.0, "10D Med Drawdown (%)": 0.0,
-                "SMA5 Exit Win Rate (%)": 0.0, "SMA5 Exit Avg Ret (%)": 0.0, "SMA5 Avg Hold (Days)": 0.0,
-                "RSI70 Exit Win Rate (%)": 0.0, "RSI70 Exit Avg Ret (%)": 0.0, "RSI70 Avg Hold (Days)": 0.0
+                "5D Win Rate (%)": 0.0, "5D Avg Ret (%)": 0.0, "5D Avg Drawdown (%)": 0.0, "5D Profit Factor": 0.0,
+                "10D Win Rate (%)": 0.0, "10D Avg Ret (%)": 0.0, "10D Avg Drawdown (%)": 0.0, "10D Profit Factor": 0.0,
+                "SMA5 Exit Win Rate (%)": 0.0, "SMA5 Exit Avg Ret (%)": 0.0, "SMA5 Avg Hold (Days)": 0.0, "SMA5 Profit Factor": 0.0,
+                "RSI70 Exit Win Rate (%)": 0.0, "RSI70 Exit Avg Ret (%)": 0.0, "RSI70 Avg Hold (Days)": 0.0, "RSI70 Profit Factor": 0.0
             })
             continue
             
         def stats_fixed(ret_series, mae_series):
             wr = (ret_series > 0).mean() * 100
             avg_r = ret_series.mean()
-            med_mae = mae_series.median()
-            return round(wr, 1), round(avg_r, 2), round(med_mae, 2)
+            avg_mae = mae_series.mean()
+            
+            gains = ret_series[ret_series > 0].sum()
+            losses = abs(ret_series[ret_series < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            return round(wr, 1), round(avg_r, 2), round(avg_mae, 2), pf
             
         def stats_dynamic(ret_series, days_series):
             wr = (ret_series > 0).mean() * 100
             avg_r = ret_series.mean()
             avg_d = days_series.mean()
-            return round(wr, 1), round(avg_r, 2), round(avg_d, 1)
             
-        wr5, avg5, mae5 = stats_fixed(sub['Fwd_5d'], sub['MAE_5d'])
-        wr10, avg10, mae10 = stats_fixed(sub['Fwd_10d'], sub['MAE_10d'])
-        wr_sma, avg_sma, days_sma = stats_dynamic(sub['Fwd_SMA5_Ret'], sub['Fwd_SMA5_Days'])
-        wr_rsi, avg_rsi, days_rsi = stats_dynamic(sub['Fwd_RSI70_Ret'], sub['Fwd_RSI70_Days'])
+            gains = ret_series[ret_series > 0].sum()
+            losses = abs(ret_series[ret_series < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            return round(wr, 1), round(avg_r, 2), round(avg_d, 1), pf
+            
+        wr5, avg5, mae5, pf5 = stats_fixed(sub['Fwd_5d'], sub['MAE_5d'])
+        wr10, avg10, mae10, pf10 = stats_fixed(sub['Fwd_10d'], sub['MAE_10d'])
+        wr_sma, avg_sma, days_sma, pf_sma = stats_dynamic(sub['Fwd_SMA5_Ret'], sub['Fwd_SMA5_Days'])
+        wr_rsi, avg_rsi, days_rsi, pf_rsi = stats_dynamic(sub['Fwd_RSI70_Ret'], sub['Fwd_RSI70_Days'])
         
         records.append({
             "RSI Bucket": b,
             "Signals": int(n),
             "5D Win Rate (%)": wr5,
             "5D Avg Ret (%)": avg5,
-            "5D Med Drawdown (%)": mae5,
+            "5D Avg Drawdown (%)": mae5,
+            "5D Profit Factor": pf5,
             "10D Win Rate (%)": wr10,
             "10D Avg Ret (%)": avg10,
-            "10D Med Drawdown (%)": mae10,
+            "10D Avg Drawdown (%)": mae10,
+            "10D Profit Factor": pf10,
             "SMA5 Exit Win Rate (%)": wr_sma,
             "SMA5 Exit Avg Ret (%)": avg_sma,
             "SMA5 Avg Hold (Days)": days_sma,
+            "SMA5 Profit Factor": pf_sma,
             "RSI70 Exit Win Rate (%)": wr_rsi,
             "RSI70 Exit Avg Ret (%)": avg_rsi,
-            "RSI70 Avg Hold (Days)": days_rsi
+            "RSI70 Avg Hold (Days)": days_rsi,
+            "RSI70 Profit Factor": pf_rsi
         })
         
     return pd.DataFrame(records).set_index("RSI Bucket")
@@ -272,7 +289,7 @@ with tab_study:
     
     col_t1, col_t2, col_t3, col_t4 = st.columns([1.1, 1.2, 1.2, 0.8])
     with col_t1:
-        study_ticker = st.text_input("Ticker Symbol", value="SPY", key="study_sym").upper().strip()
+        study_ticker = st.text_input("Ticker Symbol", value="NVDA", key="study_sym").upper().strip()
     with col_t2:
         study_indicator = st.selectbox(
             "Smoothed RSI(2) Lookback", 
@@ -346,15 +363,16 @@ with tab_study:
             if curr_bucket in perf_table.index and perf_table.loc[curr_bucket, "Signals"] > 0:
                 c_wr = perf_table.loc[curr_bucket, "5D Win Rate (%)"]
                 c_ret = perf_table.loc[curr_bucket, "5D Avg Ret (%)"]
-                c_mae = perf_table.loc[curr_bucket, "5D Med Drawdown (%)"]
+                c_mae = perf_table.loc[curr_bucket, "5D Avg Drawdown (%)"]
                 c_sma_wr = perf_table.loc[curr_bucket, "SMA5 Exit Win Rate (%)"]
+                c_sma_pf = perf_table.loc[curr_bucket, "SMA5 Profit Factor"]
                 c_sma_days = perf_table.loc[curr_bucket, "SMA5 Avg Hold (Days)"]
                 
                 st.info(
                     f"**Empirical Baseline for Current Regime ({curr_bucket})**: "
                     f"When **{study_ticker}** trades in the **{curr_bucket}** bucket, its historical **5-day forward win rate is {c_wr}%** "
-                    f"(Avg Return: **{c_ret:+.2f}%**, Median Drawdown: **{c_mae:.2f}%**). "
-                    f"Exiting dynamically on the first close above the 5-day SMA has yielded a **{c_sma_wr}% win rate** over an average hold of **{c_sma_days:.1f} days**."
+                    f"(Avg Return: **{c_ret:+.2f}%**, Avg Drawdown: **{c_mae:.2f}%**). "
+                    f"Exiting dynamically on the first close above the 5-day SMA has yielded a **{c_sma_wr}% win rate** and a **{c_sma_pf} Profit Factor** over an average hold of **{c_sma_days:.1f} days**."
                 )
             
             st.subheader(f"Expectancy & Risk Matrix across All Buckets: {study_ticker}")
@@ -363,36 +381,95 @@ with tab_study:
                 "Signals": st.column_config.NumberColumn(format="%d"),
                 "5D Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "5D Med Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Median worst intraday drawdown experienced over 5 days."),
+                "5D Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Average worst adverse price drop experienced during the 5 days."),
+                "5D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
                 "10D Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "10D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "10D Med Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Median worst intraday drawdown experienced over 10 days."),
+                "10D Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Average worst adverse price drop experienced during the 10 days."),
+                "10D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
                 "SMA5 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%", help="Win rate when exiting on the first close above 5-Day SMA."),
                 "SMA5 Exit Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "SMA5 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d", help="Average holding period to achieve Close > SMA5."),
+                "SMA5 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
+                "SMA5 Profit Factor": st.column_config.NumberColumn(format="%.2f"),
                 "RSI70 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%", help="Win rate when exiting on the first RSI(2) > 70 thrust."),
                 "RSI70 Exit Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "RSI70 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d", help="Average holding period to achieve RSI(2) > 70.")
+                "RSI70 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
+                "RSI70 Profit Factor": st.column_config.NumberColumn(format="%.2f")
             }
 
             st.dataframe(perf_table, column_config=study_col_cfg, use_container_width=True)
             
-            st.subheader("Fixed Horizon vs. Dynamic Snapback Win Rates")
-            fig_exits = go.Figure()
-            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Win Rate (%)'], name='Fixed 5-Day Exit', marker_color='#42A5F5'))
-            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Win Rate (%)'], name='Fixed 10-Day Exit', marker_color='#7E57C2'))
-            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit Win Rate (%)'], name='Dynamic Exit (Close > SMA5)', marker_color='#26A69A'))
-            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit Win Rate (%)'], name='Dynamic Exit (RSI2 > 70)', marker_color='#FFA726'))
-            fig_exits.add_hline(y=50, line_dash="dash", line_color="white", annotation_text="50% Benchmark")
-            fig_exits.update_layout(
-                barmode='group', 
-                template="plotly_dark", 
-                yaxis_title="Win Rate (%)",
-                xaxis_title="RSI(2) Smoothed Bucket", 
-                height=420, 
-                margin=dict(l=20, r=20, t=30, b=20)
-            )
-            st.plotly_chart(fig_exits, use_container_width=True)
+            # ==========================================
+            # VISUAL ANALYTICS DASHBOARD
+            # ==========================================
+            st.subheader("Quantitative Edge Visualizer")
+            
+            chart_col1, chart_col2 = st.columns(2)
+            
+            with chart_col1:
+                # Chart 1: Win Rate Comparison
+                fig_wr = go.Figure()
+                fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Win Rate (%)'], name='Fixed 5-Day', marker_color='#42A5F5'))
+                fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Win Rate (%)'], name='Fixed 10-Day', marker_color='#7E57C2'))
+                fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit Win Rate (%)'], name='Dynamic (Close > SMA5)', marker_color='#26A69A'))
+                fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit Win Rate (%)'], name='Dynamic (RSI2 > 70)', marker_color='#FFA726'))
+                fig_wr.add_hline(y=50, line_dash="dash", line_color="white", annotation_text="50% Parity")
+                fig_wr.update_layout(
+                    title="Win Rate (%) Across Exit Strategies",
+                    barmode='group', template="plotly_dark", yaxis_title="Win Rate (%)",
+                    xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_wr, use_container_width=True)
+                
+            with chart_col2:
+                # Chart 2: Average Return Comparison
+                fig_ret = go.Figure()
+                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Avg Ret (%)'], name='Fixed 5-Day', marker_color='#42A5F5'))
+                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Avg Ret (%)'], name='Fixed 10-Day', marker_color='#7E57C2'))
+                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit Avg Ret (%)'], name='Dynamic (Close > SMA5)', marker_color='#26A69A'))
+                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit Avg Ret (%)'], name='Dynamic (RSI2 > 70)', marker_color='#FFA726'))
+                fig_ret.add_hline(y=0, line_dash="dash", line_color="white")
+                fig_ret.update_layout(
+                    title="Average Net Return (%) Across Exit Strategies",
+                    barmode='group', template="plotly_dark", yaxis_title="Avg Return (%)",
+                    xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_ret, use_container_width=True)
+                
+            chart_col3, chart_col4 = st.columns(2)
+            
+            with chart_col3:
+                # Chart 3: Profit Factor Quality Metric
+                fig_pf = go.Figure()
+                fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Profit Factor'], name='Fixed 5-Day PF', marker_color='#42A5F5'))
+                fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Profit Factor'], name='SMA5 Exit PF', marker_color='#26A69A'))
+                fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Profit Factor'], name='RSI70 Exit PF', marker_color='#FFA726'))
+                fig_pf.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Breakeven (1.0)")
+                fig_pf.add_hline(y=1.5, line_dash="dot", line_color="green", annotation_text="Strong Edge (1.5)")
+                fig_pf.update_layout(
+                    title="Profit Factor Across Buckets (Gross Profit / Gross Loss)",
+                    barmode='group', template="plotly_dark", yaxis_title="Profit Factor",
+                    xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_pf, use_container_width=True)
+                
+            with chart_col4:
+                # Chart 4: Average Adverse Excursion (MAE)
+                fig_mae = go.Figure()
+                fig_mae.add_trace(go.Scatter(
+                    x=perf_table.index, y=perf_table['5D Avg Drawdown (%)'],
+                    mode='lines+markers', name='5-Day Avg Drawdown', line=dict(color='#FF5252', width=2.5)
+                ))
+                fig_mae.add_trace(go.Scatter(
+                    x=perf_table.index, y=perf_table['10D Avg Drawdown (%)'],
+                    mode='lines+markers', name='10-Day Avg Drawdown', line=dict(color='#FF7043', width=2, dash='dot')
+                ))
+                fig_mae.update_layout(
+                    title="Average Adverse Drawdown Pain (MAE %)",
+                    template="plotly_dark", yaxis_title="Average Worst Intraday Drop (%)",
+                    xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20)
+                )
+                st.plotly_chart(fig_mae, use_container_width=True)
 
 # ----------------------------------------------------
 # TAB 2: CUSTOM WATCHLIST ANALYZER
@@ -470,11 +547,16 @@ with tab_watchlist:
                         h_wr5 = (sub_history['Fwd_5d'] > 0).mean() * 100
                         h_ret5 = sub_history['Fwd_5d'].mean()
                         h_wr10 = (sub_history['Fwd_10d'] > 0).mean() * 100
-                        h_mae5 = sub_history['MAE_5d'].median()
+                        h_mae5 = sub_history['MAE_5d'].mean()
+                        
+                        gains = sub_history['Fwd_5d'][sub_history['Fwd_5d'] > 0].sum()
+                        losses = abs(sub_history['Fwd_5d'][sub_history['Fwd_5d'] < 0].sum())
+                        h_pf5 = round(gains / losses, 2) if losses > 0 else np.nan
+                        
                         h_sma_wr = (sub_history['Fwd_SMA5_Ret'] > 0).mean() * 100
                         h_sma_days = sub_history['Fwd_SMA5_Days'].mean()
                     else:
-                        h_wr5, h_ret5, h_wr10, h_mae5, h_sma_wr, h_sma_days = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+                        h_wr5, h_ret5, h_wr10, h_mae5, h_pf5, h_sma_wr, h_sma_days = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
                         
                     watchlist_results.append({
                         "Ticker": sym,
@@ -492,8 +574,9 @@ with tab_watchlist:
                         "Hist Signals": sig_count,
                         "Hist 5D Win Rate": round(h_wr5, 1) if pd.notna(h_wr5) else np.nan,
                         "Hist 5D Avg Ret (%)": round(h_ret5, 2) if pd.notna(h_ret5) else np.nan,
+                        "Hist 5D Profit Factor": h_pf5,
                         "Hist 10D Win Rate": round(h_wr10, 1) if pd.notna(h_wr10) else np.nan,
-                        "Hist Med Drawdown (%)": round(h_mae5, 2) if pd.notna(h_mae5) else np.nan,
+                        "Hist Avg Drawdown (%)": round(h_mae5, 2) if pd.notna(h_mae5) else np.nan,
                         "Hist SMA5 Exit Win Rate": round(h_sma_wr, 1) if pd.notna(h_sma_wr) else np.nan
                     })
                 except Exception:
@@ -521,8 +604,9 @@ with tab_watchlist:
                     "Hist Signals": st.column_config.NumberColumn(help="Historical occurrences in this bucket.", format="%d"),
                     "Hist 5D Win Rate": st.column_config.ProgressColumn(help="Historical 5-day win rate from current bucket.", format="%.1f%%", min_value=0, max_value=100),
                     "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Hist 5D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
                     "Hist 10D Win Rate": st.column_config.ProgressColumn(help="Historical 10-day win rate from current bucket.", format="%.1f%%", min_value=0, max_value=100),
-                    "Hist Med Drawdown (%)": st.column_config.NumberColumn(help="Median 5-day worst drawdown experienced from this bucket.", format="%.2f%%"),
+                    "Hist Avg Drawdown (%)": st.column_config.NumberColumn(help="Average adverse price drop experienced from this bucket.", format="%.2f%%"),
                     "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(help="Win rate exiting on first Close > SMA5.", format="%.1f%%", min_value=0, max_value=100)
                 }
                 
@@ -634,10 +718,15 @@ with tab_screener:
                 if len(sub_hist) > 0:
                     h_5d_wr = (sub_hist['Fwd_5d'] > 0).mean() * 100
                     h_5d_avg = sub_hist['Fwd_5d'].mean()
-                    h_mae = sub_hist['MAE_5d'].median()
+                    h_mae = sub_hist['MAE_5d'].mean()
+                    
+                    gains = sub_hist['Fwd_5d'][sub_hist['Fwd_5d'] > 0].sum()
+                    losses = abs(sub_hist['Fwd_5d'][sub_history['Fwd_5d'] < 0].sum()) if 'Fwd_5d' in sub_hist else 0
+                    h_pf = round(gains / losses, 2) if losses > 0 else np.nan
+                    
                     h_sma5_wr = (sub_hist['Fwd_SMA5_Ret'] > 0).mean() * 100
                 else:
-                    h_5d_wr, h_5d_avg, h_mae, h_sma5_wr = np.nan, np.nan, np.nan, np.nan
+                    h_5d_wr, h_5d_avg, h_mae, h_pf, h_sma5_wr = np.nan, np.nan, np.nan, np.nan, np.nan
                     
                 screener_rows.append({
                     "Ticker": sym,
@@ -654,7 +743,8 @@ with tab_screener:
                     "Prior 10D Ret (%)": round(latest['Prior_10d'], 2),
                     "Hist 5D Win Rate": round(h_5d_wr, 1) if pd.notna(h_5d_wr) else np.nan,
                     "Hist 5D Avg Ret (%)": round(h_5d_avg, 2) if pd.notna(h_5d_avg) else np.nan,
-                    "Hist Med Drawdown (%)": round(h_mae, 2) if pd.notna(h_mae) else np.nan,
+                    "Hist 5D Profit Factor": h_pf,
+                    "Hist Avg Drawdown (%)": round(h_mae, 2) if pd.notna(h_mae) else np.nan,
                     "Hist SMA5 Exit Win Rate": round(h_sma5_wr, 1) if pd.notna(h_sma5_wr) else np.nan
                 })
             except Exception:
@@ -689,7 +779,8 @@ with tab_screener:
                 "Prior 10D Ret (%)": st.column_config.NumberColumn(help="Trailing 10-day return momentum.", format="%+.2f%%"),
                 "Hist 5D Win Rate": st.column_config.ProgressColumn(help="2-year historical 5-day forward win rate.", format="%.1f%%", min_value=0, max_value=100),
                 "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(help="Average 5-day forward return.", format="%+.2f%%"),
-                "Hist Med Drawdown (%)": st.column_config.NumberColumn(help="Median 5-day Maximum Adverse Excursion (worst drawdown experienced).", format="%.2f%%"),
+                "Hist 5D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                "Hist Avg Drawdown (%)": st.column_config.NumberColumn(help="Average 5-day adverse drawdown drop experienced.", format="%.2f%%"),
                 "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(help="Win rate exiting dynamically when Close > 5-Day SMA.", format="%.1f%%", min_value=0, max_value=100)
             }
             
