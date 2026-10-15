@@ -12,7 +12,7 @@ st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
 st.title("Cumulative RSI(2) Quantitative Edge Platform")
 st.caption(
     "Parametric Multi-Day Smoothed RSI(2) Engine | Real-Time Ticker Watchlist Analyzer | "
-    "Dynamic Snapback Exits (SMA5, RSI70) | Profit Factor & Average MAE Pain Analytics."
+    "Year-by-Year Consistency Audit | Dynamic Snapback Exits (SMA5, RSI70) | MAE Drawdown Tracking."
 )
 
 # ==========================================
@@ -71,7 +71,6 @@ def prepare_stock_data(df):
     raw_mae_5d = (min_low_5d - close_s) / close_s * 100
     raw_mae_10d = (min_low_10d - close_s) / close_s * 100
     
-    # Drawdown cannot be positive: if price never traded below entry close, MAE is 0.0%
     df['MAE_5d'] = raw_mae_5d.clip(upper=0.0)
     df['MAE_10d'] = raw_mae_10d.clip(upper=0.0)
     
@@ -198,6 +197,68 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require
         })
         
     return pd.DataFrame(records).set_index("RSI Bucket")
+
+def aggregate_yearly_performance(df, bucket_col, selected_buckets, exit_col_ret, exit_col_days=None, require_uptrend=False, fresh_entry_only=False):
+    """Calculates yearly breakdown metrics for an asset under chosen bucket and exit criteria."""
+    data = df.dropna(subset=[bucket_col, exit_col_ret]).copy()
+    
+    if require_uptrend:
+        data = data[data['Above_200SMA'] == True]
+        
+    if fresh_entry_only:
+        data = data[data[bucket_col] != data[bucket_col].shift(1)]
+        
+    data = data[data[bucket_col].astype(str).isin(selected_buckets)]
+    
+    if data.empty:
+        return pd.DataFrame()
+        
+    data['Year'] = data.index.year
+    records = []
+    
+    for yr, group in data.groupby('Year'):
+        n_sigs = len(group)
+        ret_s = group[exit_col_ret]
+        
+        wr = (ret_s > 0).mean() * 100
+        avg_ret = ret_s.mean()
+        
+        gains = ret_s[ret_s > 0].sum()
+        losses = abs(ret_s[ret_s < 0].sum())
+        pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
+        
+        comp_ret = ((1 + ret_s / 100).prod() - 1) * 100
+        avg_days = group[exit_col_days].mean() if exit_col_days and exit_col_days in group else np.nan
+        
+        records.append({
+            "Year": str(yr),
+            "Signals": int(n_sigs),
+            "Win Rate (%)": round(wr, 1),
+            "Avg Return (%)": round(avg_ret, 2),
+            "Profit Factor": pf,
+            "Annual Compounded Ret (%)": round(comp_ret, 2),
+            "Avg Hold (Days)": round(avg_days, 1) if pd.notna(avg_days) else np.nan
+        })
+        
+    # Summary Totals Across All Years
+    all_ret = data[exit_col_ret]
+    all_gains = all_ret[all_ret > 0].sum()
+    all_losses = abs(all_ret[all_ret < 0].sum())
+    all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
+    all_comp = ((1 + all_ret / 100).prod() - 1) * 100
+    all_days = data[exit_col_days].mean() if exit_col_days and exit_col_days in data else np.nan
+
+    records.append({
+        "Year": "All Years",
+        "Signals": int(len(data)),
+        "Win Rate (%)": round((all_ret > 0).mean() * 100, 1),
+        "Avg Return (%)": round(all_ret.mean(), 2),
+        "Profit Factor": all_pf,
+        "Annual Compounded Ret (%)": round(all_comp, 2),
+        "Avg Hold (Days)": round(all_days, 1) if pd.notna(all_days) else np.nan
+    })
+    
+    return pd.DataFrame(records).set_index("Year")
 
 # ==========================================
 # 2. UNIVERSE FETCHERS & PARSERS
@@ -407,7 +468,6 @@ with tab_study:
             chart_col1, chart_col2 = st.columns(2)
             
             with chart_col1:
-                # Chart 1: Win Rate Comparison
                 fig_wr = go.Figure()
                 fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Win Rate (%)'], name='Fixed 5-Day', marker_color='#42A5F5'))
                 fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Win Rate (%)'], name='Fixed 10-Day', marker_color='#7E57C2'))
@@ -422,7 +482,6 @@ with tab_study:
                 st.plotly_chart(fig_wr, use_container_width=True)
                 
             with chart_col2:
-                # Chart 2: Average Return Comparison
                 fig_ret = go.Figure()
                 fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Avg Ret (%)'], name='Fixed 5-Day', marker_color='#42A5F5'))
                 fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Avg Ret (%)'], name='Fixed 10-Day', marker_color='#7E57C2'))
@@ -439,7 +498,6 @@ with tab_study:
             chart_col3, chart_col4 = st.columns(2)
             
             with chart_col3:
-                # Chart 3: Profit Factor Quality Metric
                 fig_pf = go.Figure()
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Profit Factor'], name='Fixed 5-Day PF', marker_color='#42A5F5'))
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Profit Factor'], name='SMA5 Exit PF', marker_color='#26A69A'))
@@ -454,7 +512,6 @@ with tab_study:
                 st.plotly_chart(fig_pf, use_container_width=True)
                 
             with chart_col4:
-                # Chart 4: Average Adverse Excursion (MAE)
                 fig_mae = go.Figure()
                 fig_mae.add_trace(go.Scatter(
                     x=perf_table.index, y=perf_table['5D Avg Drawdown (%)'],
@@ -470,6 +527,106 @@ with tab_study:
                     xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20)
                 )
                 st.plotly_chart(fig_mae, use_container_width=True)
+
+            # ==========================================
+            # YEAR-BY-YEAR PERFORMANCE BREAKDOWN
+            # ==========================================
+            st.divider()
+            st.subheader(f"📅 Year-by-Year Performance Breakdown: {study_ticker}")
+            st.write("Audit strategy consistency across different market cycles and verify whether your edge held up annually.")
+            
+            col_y1, col_y2 = st.columns([1.5, 2.5])
+            with col_y1:
+                year_exit_strat = st.selectbox(
+                    "Evaluate Exit Strategy",
+                    [
+                        "Dynamic Snapback: Close > 5-Day SMA",
+                        "Dynamic Snapback: RSI(2) > 70",
+                        "Fixed 5-Day Holding Period",
+                        "Fixed 10-Day Holding Period"
+                    ],
+                    index=0
+                )
+            with col_y2:
+                bucket_scope_options = [
+                    f"Current Bucket Only ({curr_bucket})",
+                    "Oversold Washouts (0-20)",
+                    "Severe Capitulation (0-10)",
+                    "All Buckets (0-100)"
+                ]
+                year_bucket_scope = st.selectbox("Bucket Selection Scope", bucket_scope_options, index=1)
+                
+            # Map user selection to columns and buckets
+            if year_exit_strat == "Dynamic Snapback: Close > 5-Day SMA":
+                target_ret_col = "Fwd_SMA5_Ret"
+                target_days_col = "Fwd_SMA5_Days"
+            elif year_exit_strat == "Dynamic Snapback: RSI(2) > 70":
+                target_ret_col = "Fwd_RSI70_Ret"
+                target_days_col = "Fwd_RSI70_Days"
+            elif year_exit_strat == "Fixed 5-Day Holding Period":
+                target_ret_col = "Fwd_5d"
+                target_days_col = None
+            else:
+                target_ret_col = "Fwd_10d"
+                target_days_col = None
+                
+            if "Current Bucket Only" in year_bucket_scope:
+                chosen_buckets = [curr_bucket]
+            elif "Oversold Washouts" in year_bucket_scope:
+                chosen_buckets = ['0-10', '11-20']
+            elif "Severe Capitulation" in year_bucket_scope:
+                chosen_buckets = ['0-10']
+            else:
+                chosen_buckets = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
+                
+            yearly_table = aggregate_yearly_performance(
+                processed_df,
+                active_bucket_col,
+                chosen_buckets,
+                target_ret_col,
+                target_days_col,
+                require_uptrend=require_uptrend_study,
+                fresh_entry_only=fresh_only
+            )
+            
+            if not yearly_table.empty:
+                year_col_cfg = {
+                    "Signals": st.column_config.NumberColumn(format="%d"),
+                    "Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+                    "Avg Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                    "Annual Compounded Ret (%)": st.column_config.NumberColumn(format="%+.2f%%", help="Compounded return realized taking all signals in that calendar year."),
+                    "Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d")
+                }
+                
+                st.dataframe(yearly_table, column_config=year_col_cfg, use_container_width=True)
+                
+                # Visual Annual Compounding Bar Chart
+                chart_year_df = yearly_table[yearly_table.index != "All Years"].copy()
+                if not chart_year_df.empty:
+                    bar_colors = ['#00FF66' if r >= 0 else '#FF3366' for r in chart_year_df['Annual Compounded Ret (%)']]
+                    
+                    fig_annual = go.Figure()
+                    fig_annual.add_trace(go.Bar(
+                        x=chart_year_df.index,
+                        y=chart_year_df['Annual Compounded Ret (%)'],
+                        marker_color=bar_colors,
+                        hovertext=[f"Year: {y}<br>Return: {r:+.2f}%<br>Trades: {s}<br>Win Rate: {w:.1f}%" 
+                                   for y, r, s, w in zip(chart_year_df.index, chart_year_df['Annual Compounded Ret (%)'], chart_year_df['Signals'], chart_year_df['Win Rate (%)'])],
+                        hoverinfo='text'
+                    ))
+                    fig_annual.add_hline(y=0, line_dash="dash", line_color="white")
+                    fig_annual.update_layout(
+                        title=f"{study_ticker} Annual Compounded Strategy Return (%) by Year ({year_exit_strat})",
+                        template="plotly_dark",
+                        yaxis_title="Compounded Return (%)",
+                        xaxis_title="Year",
+                        height=380,
+                        margin=dict(l=20, r=20, t=40, b=20)
+                    )
+                    st.plotly_chart(fig_annual, use_container_width=True)
+            else:
+                st.info(f"No signals generated across the chosen bucket scope ({', '.join(chosen_buckets)}) to construct yearly tables.")
 
 # ----------------------------------------------------
 # TAB 2: CUSTOM WATCHLIST ANALYZER
@@ -549,9 +706,9 @@ with tab_watchlist:
                         h_wr10 = (sub_history['Fwd_10d'] > 0).mean() * 100
                         h_mae5 = sub_history['MAE_5d'].mean()
                         
-                        gains = sub_history['Fwd_5d'][sub_history['Fwd_5d'] > 0].sum()
-                        losses = abs(sub_history['Fwd_5d'][sub_history['Fwd_5d'] < 0].sum())
-                        h_pf5 = round(gains / losses, 2) if losses > 0 else np.nan
+                        gains = sub_history[sub_history['Fwd_5d'] > 0]['Fwd_5d'].sum()
+                        losses = abs(sub_history[sub_history['Fwd_5d'] < 0]['Fwd_5d'].sum())
+                        h_pf5 = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
                         
                         h_sma_wr = (sub_history['Fwd_SMA5_Ret'] > 0).mean() * 100
                         h_sma_days = sub_history['Fwd_SMA5_Days'].mean()
@@ -720,9 +877,9 @@ with tab_screener:
                     h_5d_avg = sub_hist['Fwd_5d'].mean()
                     h_mae = sub_hist['MAE_5d'].mean()
                     
-                    gains = sub_hist['Fwd_5d'][sub_hist['Fwd_5d'] > 0].sum()
-                    losses = abs(sub_hist['Fwd_5d'][sub_history['Fwd_5d'] < 0].sum()) if 'Fwd_5d' in sub_hist else 0
-                    h_pf = round(gains / losses, 2) if losses > 0 else np.nan
+                    gains = sub_hist[sub_hist['Fwd_5d'] > 0]['Fwd_5d'].sum()
+                    losses = abs(sub_hist[sub_hist['Fwd_5d'] < 0]['Fwd_5d'].sum())
+                    h_pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
                     
                     h_sma5_wr = (sub_hist['Fwd_SMA5_Ret'] > 0).mean() * 100
                 else:
