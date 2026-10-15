@@ -297,4 +297,410 @@ with tab_study:
         with st.spinner(f"Analyzing daily tick data for {study_ticker}..."):
             raw_df = fetch_daily_data(study_ticker, start_date, end_date)
             
-        if raw_df is None or len
+        if raw_df is None or len(raw_df) < 220:
+            st.error(f"Insufficient history found for {study_ticker} (minimum 220 trading sessions required).")
+        else:
+            processed_df = prepare_stock_data(raw_df)
+            
+            bucket_map = {
+                "2-Day Average RSI(2)": "Bucket_2d",
+                "3-Day Average RSI(2)": "Bucket_3d",
+                "5-Day Average RSI(2)": "Bucket_5d",
+                "10-Day Average RSI(2)": "Bucket_10d"
+            }
+            indicator_col_map = {
+                "2-Day Average RSI(2)": "RSI2_2d_avg",
+                "3-Day Average RSI(2)": "RSI2_3d_avg",
+                "5-Day Average RSI(2)": "RSI2_5d_avg",
+                "10-Day Average RSI(2)": "RSI2_10d_avg"
+            }
+            
+            active_bucket_col = bucket_map[study_indicator]
+            active_ind_col = indicator_col_map[study_indicator]
+            fresh_only = (signal_mode == "Fresh Entry Day Only (No Overlap)")
+            
+            # --- Live Current Status Overview Panel ---
+            latest_row = processed_df.iloc[-1]
+            curr_price = latest_row['Adj Close'] if 'Adj Close' in latest_row else latest_row['Close']
+            curr_rsi2 = latest_row['RSI2']
+            curr_ind_val = latest_row[active_ind_col]
+            curr_bucket = str(latest_row[active_bucket_col])
+            is_above_200 = bool(latest_row['Above_200SMA'])
+            
+            st.subheader(f"Current Market Status: {study_ticker}")
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Current Price", f"${curr_price:.2f}")
+            m2.metric("RSI(2) (Single Bar)", f"{curr_rsi2:.1f}")
+            m3.metric(f"Current {study_indicator}", f"{curr_ind_val:.1f}")
+            m4.metric("Active Regime Bucket", curr_bucket)
+            m5.metric("Trend (> 200 SMA)", "Uptrend (Bullish)" if is_above_200 else "Downtrend (Bearish)")
+            
+            # Historical Table Calculation
+            perf_table = aggregate_bucket_performance(
+                processed_df, 
+                active_bucket_col, 
+                fresh_entry_only=fresh_only,
+                require_uptrend=require_uptrend_study
+            )
+            
+            if curr_bucket in perf_table.index and perf_table.loc[curr_bucket, "Signals"] > 0:
+                c_wr = perf_table.loc[curr_bucket, "5D Win Rate (%)"]
+                c_ret = perf_table.loc[curr_bucket, "5D Avg Ret (%)"]
+                c_mae = perf_table.loc[curr_bucket, "5D Med Drawdown (%)"]
+                c_sma_wr = perf_table.loc[curr_bucket, "SMA5 Exit Win Rate (%)"]
+                c_sma_days = perf_table.loc[curr_bucket, "SMA5 Avg Hold (Days)"]
+                
+                st.info(
+                    f"**Empirical Baseline for Current Regime ({curr_bucket})**: "
+                    f"When **{study_ticker}** trades in the **{curr_bucket}** bucket, its historical **5-day forward win rate is {c_wr}%** "
+                    f"(Avg Return: **{c_ret:+.2f}%**, Median Drawdown: **{c_mae:.2f}%**). "
+                    f"Exiting dynamically on the first close above the 5-day SMA has yielded a **{c_sma_wr}% win rate** over an average hold of **{c_sma_days:.1f} days**."
+                )
+            
+            st.subheader(f"Expectancy & Risk Matrix across All Buckets: {study_ticker}")
+            
+            study_col_cfg = {
+                "Signals": st.column_config.NumberColumn(format="%d"),
+                "5D Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                "5D Med Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Median worst intraday drawdown experienced over 5 days."),
+                "10D Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                "10D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                "10D Med Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Median worst intraday drawdown experienced over 10 days."),
+                "SMA5 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%", help="Win rate when exiting on the first close above 5-Day SMA."),
+                "SMA5 Exit Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                "SMA5 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d", help="Average holding period to achieve Close > SMA5."),
+                "RSI70 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%", help="Win rate when exiting on the first RSI(2) > 70 thrust."),
+                "RSI70 Exit Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                "RSI70 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d", help="Average holding period to achieve RSI(2) > 70.")
+            }
+
+            st.dataframe(perf_table, column_config=study_col_cfg, use_container_width=True)
+            
+            st.subheader("Fixed Horizon vs. Dynamic Snapback Win Rates")
+            fig_exits = go.Figure()
+            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Win Rate (%)'], name='Fixed 5-Day Exit', marker_color='#42A5F5'))
+            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Win Rate (%)'], name='Fixed 10-Day Exit', marker_color='#7E57C2'))
+            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit Win Rate (%)'], name='Dynamic Exit (Close > SMA5)', marker_color='#26A69A'))
+            fig_exits.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit Win Rate (%)'], name='Dynamic Exit (RSI2 > 70)', marker_color='#FFA726'))
+            fig_exits.add_hline(y=50, line_dash="dash", line_color="white", annotation_text="50% Benchmark")
+            fig_exits.update_layout(
+                barmode='group', 
+                template="plotly_dark", 
+                yaxis_title="Win Rate (%)",
+                xaxis_title="RSI(2) Smoothed Bucket", 
+                height=420, 
+                margin=dict(l=20, r=20, t=30, b=20)
+            )
+            st.plotly_chart(fig_exits, use_container_width=True)
+
+# ----------------------------------------------------
+# TAB 2: CUSTOM WATCHLIST ANALYZER
+# ----------------------------------------------------
+with tab_watchlist:
+    st.header("Custom Watchlist Analyzer")
+    st.write(
+        "Enter your personal tickers to see real-time RSI readings, trailing returns, "
+        "and empirical forward expectancy calculated specifically from each stock's current bucket."
+    )
+    
+    col_w1, col_w2, col_w3 = st.columns([2.5, 1.2, 1])
+    with col_w1:
+        watchlist_input = st.text_input(
+            "Enter Ticker Symbols (comma or space separated)",
+            value="SPY, QQQ, AAPL, MSFT, NVDA, TSLA, AMZN, IWM"
+        )
+    with col_w2:
+        watch_lookback_choice = st.selectbox(
+            "Primary Regime Indicator",
+            ["5D Avg RSI(2)", "3D Avg RSI(2)", "2D Avg RSI(2)", "10D Avg RSI(2)"],
+            index=0
+        )
+    with col_w3:
+        watch_hist_years = st.number_input("Historical Depth (Years)", min_value=2, max_value=20, value=5)
+        
+    watch_uptrend_only = st.checkbox(
+        "Require Historical Signals to be Above 200 SMA",
+        value=True,
+        help="Evaluates each stock's historical bucket edge only during structural bull trends."
+    )
+    
+    run_watch = st.button("Analyze Custom Watchlist", type="primary", use_container_width=True)
+    
+    if run_watch:
+        watch_tickers = [s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', watchlist_input) if s.strip()]
+        
+        if not watch_tickers:
+            st.warning("Please enter at least one valid ticker symbol.")
+        else:
+            with st.spinner(f"Fetching daily data and computing forward expectancy for {len(watch_tickers)} stocks..."):
+                start_w = (datetime.now() - timedelta(days=watch_hist_years * 365)).strftime('%Y-%m-%d')
+                end_w = datetime.now().strftime('%Y-%m-%d')
+                
+                bulk_w = yf.download(watch_tickers, start=start_w, end=end_w, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+                
+            w_bucket_map = {
+                "2D Avg RSI(2)": "Bucket_2d",
+                "3D Avg RSI(2)": "Bucket_3d",
+                "5D Avg RSI(2)": "Bucket_5d",
+                "10D Avg RSI(2)": "Bucket_10d"
+            }
+            active_w_bucket_col = w_bucket_map[watch_lookback_choice]
+            
+            watchlist_results = []
+            for sym in watch_tickers:
+                try:
+                    df_sym = extract_symbol_daily(bulk_w, sym, len(watch_tickers))
+                    if len(df_sym) < 220:
+                        continue
+                        
+                    prep_df = prepare_stock_data(df_sym)
+                    latest = prep_df.iloc[-1]
+                    
+                    curr_p = latest['Adj Close'] if 'Adj Close' in latest else latest['Close']
+                    curr_b = str(latest[active_w_bucket_col])
+                    is_bull = bool(latest['Above_200SMA'])
+                    
+                    sub_history = prep_df[prep_df[active_w_bucket_col] == curr_b].dropna(subset=['Fwd_5d', 'MAE_5d', 'Fwd_SMA5_Ret'])
+                    if watch_uptrend_only:
+                        sub_history = sub_history[sub_history['Above_200SMA'] == True]
+                        
+                    sig_count = len(sub_history)
+                    if sig_count > 0:
+                        h_wr5 = (sub_history['Fwd_5d'] > 0).mean() * 100
+                        h_ret5 = sub_history['Fwd_5d'].mean()
+                        h_wr10 = (sub_history['Fwd_10d'] > 0).mean() * 100
+                        h_mae5 = sub_history['MAE_5d'].median()
+                        h_sma_wr = (sub_history['Fwd_SMA5_Ret'] > 0).mean() * 100
+                        h_sma_days = sub_history['Fwd_SMA5_Days'].mean()
+                    else:
+                        h_wr5, h_ret5, h_wr10, h_mae5, h_sma_wr, h_sma_days = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+                        
+                    watchlist_results.append({
+                        "Ticker": sym,
+                        "Price": round(curr_p, 2),
+                        "RSI(2)": round(latest['RSI2'], 1),
+                        "2D Avg": round(latest['RSI2_2d_avg'], 1),
+                        "3D Avg": round(latest['RSI2_3d_avg'], 1),
+                        "5D Avg": round(latest['RSI2_5d_avg'], 1),
+                        "10D Avg": round(latest['RSI2_10d_avg'], 1),
+                        "Current Bucket": curr_b,
+                        "> 200 SMA": "Yes" if is_bull else "No",
+                        "Prior 5D (%)": round(latest['Prior_5d'], 2),
+                        "Prior 10D (%)": round(latest['Prior_10d'], 2),
+                        "Prior 15D (%)": round(latest['Prior_15d'], 2),
+                        "Hist Signals": sig_count,
+                        "Hist 5D Win Rate": round(h_wr5, 1) if pd.notna(h_wr5) else np.nan,
+                        "Hist 5D Avg Ret (%)": round(h_ret5, 2) if pd.notna(h_ret5) else np.nan,
+                        "Hist 10D Win Rate": round(h_wr10, 1) if pd.notna(h_wr10) else np.nan,
+                        "Hist Med Drawdown (%)": round(h_mae5, 2) if pd.notna(h_mae5) else np.nan,
+                        "Hist SMA5 Exit Win Rate": round(h_sma_wr, 1) if pd.notna(h_sma_wr) else np.nan
+                    })
+                except Exception:
+                    pass
+                    
+            w_df = pd.DataFrame(watchlist_results)
+            
+            if not w_df.empty:
+                st.subheader(f"Watchlist Diagnostics ({len(w_df)} Tickers Analyzed)")
+                w_df = w_df.sort_values(by="5D Avg", ascending=True)
+                
+                w_cfg = {
+                    "Ticker": st.column_config.TextColumn(help="Ticker Symbol."),
+                    "Price": st.column_config.NumberColumn(format="$%.2f"),
+                    "RSI(2)": st.column_config.NumberColumn(help="Single-day RSI(2).", format="%.1f"),
+                    "2D Avg": st.column_config.NumberColumn(format="%.1f"),
+                    "3D Avg": st.column_config.NumberColumn(format="%.1f"),
+                    "5D Avg": st.column_config.NumberColumn(format="%.1f"),
+                    "10D Avg": st.column_config.NumberColumn(format="%.1f"),
+                    "Current Bucket": st.column_config.TextColumn(help=f"Bucket under {watch_lookback_choice}."),
+                    "> 200 SMA": st.column_config.TextColumn(help="Trend qualification status."),
+                    "Prior 5D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Prior 10D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Prior 15D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Hist Signals": st.column_config.NumberColumn(help="Historical occurrences in this bucket.", format="%d"),
+                    "Hist 5D Win Rate": st.column_config.ProgressColumn(help="Historical 5-day win rate from current bucket.", format="%.1f%%", min_value=0, max_value=100),
+                    "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Hist 10D Win Rate": st.column_config.ProgressColumn(help="Historical 10-day win rate from current bucket.", format="%.1f%%", min_value=0, max_value=100),
+                    "Hist Med Drawdown (%)": st.column_config.NumberColumn(help="Median 5-day worst drawdown experienced from this bucket.", format="%.2f%%"),
+                    "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(help="Win rate exiting on first Close > SMA5.", format="%.1f%%", min_value=0, max_value=100)
+                }
+                
+                st.dataframe(w_df, column_config=w_cfg, use_container_width=True)
+                
+                st.download_button(
+                    label="Download Watchlist Results as CSV",
+                    data=w_df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"watchlist_rsi_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime='text/csv'
+                )
+            else:
+                st.info("No valid stock data could be extracted for the provided tickers.")
+
+# ----------------------------------------------------
+# TAB 3: LIVE MARKET SCREENER
+# ----------------------------------------------------
+with tab_screener:
+    st.header("Live Cumulative RSI(2) Screener")
+    st.write(
+        "Screens constituents for current RSI(2) regimes, checks 200-day trend qualification, "
+        "and synchronizes signals with broad S&P 500 macro breadth."
+    )
+    
+    col_s1, col_s2, col_s3, col_s4 = st.columns([1.1, 1.2, 1.3, 0.8])
+    with col_s1:
+        universe_choice = st.selectbox("Screener Universe", ["S&P 500", "Nasdaq 100", "Dow Jones 30", "Major ETFs"])
+    with col_s2:
+        screener_lookback = st.selectbox(
+            "Filter By Indicator",
+            ["5D Avg RSI(2)", "3D Avg RSI(2)", "2D Avg RSI(2)", "10D Avg RSI(2)"],
+            index=0
+        )
+    with col_s3:
+        bucket_filter = st.multiselect(
+            "Filter Target Buckets",
+            options=['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100'],
+            default=['0-10', '11-20'],
+            help="Defaults to high-edge oversold washouts (0-20)."
+        )
+    with col_s4:
+        st.write("")
+        st.write("")
+        run_screener = st.button("Run Live Screen", type="primary", use_container_width=True)
+        
+    require_uptrend_screener = st.checkbox(
+        "Enforce 200-Day SMA Trend Gate (Only show stocks trading above 200-Day SMA)",
+        value=True,
+        help="Restricts screener to healthy structural uptrends, filtering out secular losers."
+    )
+        
+    if run_screener:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        status_text.text("Checking broad market S&P 500 (SPY) breadth...")
+        spy_raw = yf.download("SPY", period="6mo", interval="1d", auto_adjust=False, progress=False)
+        spy_prep = prepare_stock_data(spy_raw)
+        latest_spy_rsi5 = spy_prep['RSI2_5d_avg'].iloc[-1]
+        
+        if latest_spy_rsi5 <= 25:
+            macro_tag = "Systemic Flush (Broad Market Oversold - High Edge)"
+            macro_desc = "Broad market capitulation detected (SPY 5D Avg RSI <= 25). Historical recovery odds are elevated."
+            macro_color = "success"
+        else:
+            macro_tag = "Idiosyncratic Dip (Selective / Stock-Specific)"
+            macro_desc = f"Broad market is neutral/bullish (SPY 5D Avg RSI = {latest_spy_rsi5:.1f}). Dips are stock-specific."
+            macro_color = "info"
+            
+        progress_bar.progress(15)
+        
+        status_text.text(f"Fetching constituents for {universe_choice}...")
+        tickers = get_universe_tickers(universe_choice)
+        progress_bar.progress(30)
+        
+        status_text.text(f"Downloading daily market data for {len(tickers)} stocks...")
+        bulk_data = yf.download(tickers, period="2y", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=True)
+        progress_bar.progress(70)
+        
+        status_text.text("Evaluating indicators, MAE drawdowns, and dynamic snapbacks...")
+        screener_rows = []
+        
+        lookback_key_map = {
+            "2D Avg RSI(2)": "Bucket_2d",
+            "3D Avg RSI(2)": "Bucket_3d",
+            "5D Avg RSI(2)": "Bucket_5d",
+            "10D Avg RSI(2)": "Bucket_10d"
+        }
+        active_filter_bucket = lookback_key_map[screener_lookback]
+        
+        for sym in tickers:
+            try:
+                df_sym = extract_symbol_daily(bulk_data, sym, len(tickers))
+                if len(df_sym) < 220:
+                    continue
+                    
+                processed = prepare_stock_data(df_sym)
+                latest = processed.iloc[-1]
+                
+                is_above_200 = bool(latest['Above_200SMA'])
+                if require_uptrend_screener and not is_above_200:
+                    continue
+                    
+                target_b = str(latest[active_filter_bucket])
+                if bucket_filter and target_b not in bucket_filter:
+                    continue
+                    
+                sub_hist = processed[processed[active_filter_bucket] == target_b].dropna(subset=['Fwd_5d', 'MAE_5d', 'Fwd_SMA5_Ret'])
+                if len(sub_hist) > 0:
+                    h_5d_wr = (sub_hist['Fwd_5d'] > 0).mean() * 100
+                    h_5d_avg = sub_hist['Fwd_5d'].mean()
+                    h_mae = sub_hist['MAE_5d'].median()
+                    h_sma5_wr = (sub_hist['Fwd_SMA5_Ret'] > 0).mean() * 100
+                else:
+                    h_5d_wr, h_5d_avg, h_mae, h_sma5_wr = np.nan, np.nan, np.nan, np.nan
+                    
+                screener_rows.append({
+                    "Ticker": sym,
+                    "Current Price": round(latest['Adj Close'] if 'Adj Close' in latest else latest['Close'], 2),
+                    "RSI(2)": round(latest['RSI2'], 1),
+                    "2D Avg": round(latest['RSI2_2d_avg'], 1),
+                    "3D Avg": round(latest['RSI2_3d_avg'], 1),
+                    "5D Avg": round(latest['RSI2_5d_avg'], 1),
+                    "10D Avg": round(latest['RSI2_10d_avg'], 1),
+                    "Active Bucket": target_b,
+                    "Above 200 SMA": "Yes" if is_above_200 else "No",
+                    "Market Context": "Systemic" if latest_spy_rsi5 <= 25 else "Idiosyncratic",
+                    "Prior 5D Ret (%)": round(latest['Prior_5d'], 2),
+                    "Prior 10D Ret (%)": round(latest['Prior_10d'], 2),
+                    "Hist 5D Win Rate": round(h_5d_wr, 1) if pd.notna(h_5d_wr) else np.nan,
+                    "Hist 5D Avg Ret (%)": round(h_5d_avg, 2) if pd.notna(h_5d_avg) else np.nan,
+                    "Hist Med Drawdown (%)": round(h_mae, 2) if pd.notna(h_mae) else np.nan,
+                    "Hist SMA5 Exit Win Rate": round(h_sma5_wr, 1) if pd.notna(h_sma5_wr) else np.nan
+                })
+            except Exception:
+                pass
+                
+        progress_bar.progress(100)
+        status_text.empty()
+        
+        if macro_color == "success":
+            st.success(f"Macro Breadth Regime: {macro_tag} | {macro_desc}")
+        else:
+            st.info(f"Macro Breadth Regime: {macro_tag} | {macro_desc}")
+        
+        screen_df = pd.DataFrame(screener_rows)
+        
+        if not screen_df.empty:
+            st.subheader(f"Filtered Setups: {len(screen_df)} Opportunities Found")
+            screen_df = screen_df.sort_values(by="5D Avg", ascending=True)
+            
+            screener_col_cfg = {
+                "Ticker": st.column_config.TextColumn(help="Asset Ticker Symbol."),
+                "Current Price": st.column_config.NumberColumn(format="$%.2f"),
+                "RSI(2)": st.column_config.NumberColumn(help="Single-day RSI(2) close.", format="%.1f"),
+                "2D Avg": st.column_config.NumberColumn(help="Connors 2-Day Smoothed RSI(2).", format="%.1f"),
+                "3D Avg": st.column_config.NumberColumn(help="Connors 3-Day Smoothed RSI(2).", format="%.1f"),
+                "5D Avg": st.column_config.NumberColumn(help="5-Day Rolling Average RSI(2).", format="%.1f"),
+                "10D Avg": st.column_config.NumberColumn(help="10-Day Rolling Average RSI(2).", format="%.1f"),
+                "Active Bucket": st.column_config.TextColumn(help=f"Bucket level under {screener_lookback}."),
+                "Above 200 SMA": st.column_config.TextColumn(help="Trend verification filter."),
+                "Market Context": st.column_config.TextColumn(help="Systemic (SPY Oversold) vs Idiosyncratic (Stock-Specific)."),
+                "Prior 5D Ret (%)": st.column_config.NumberColumn(help="Trailing 5-day return momentum.", format="%+.2f%%"),
+                "Prior 10D Ret (%)": st.column_config.NumberColumn(help="Trailing 10-day return momentum.", format="%+.2f%%"),
+                "Hist 5D Win Rate": st.column_config.ProgressColumn(help="2-year historical 5-day forward win rate.", format="%.1f%%", min_value=0, max_value=100),
+                "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(help="Average 5-day forward return.", format="%+.2f%%"),
+                "Hist Med Drawdown (%)": st.column_config.NumberColumn(help="Median 5-day Maximum Adverse Excursion (worst drawdown experienced).", format="%.2f%%"),
+                "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(help="Win rate exiting dynamically when Close > 5-Day SMA.", format="%.1f%%", min_value=0, max_value=100)
+            }
+            
+            st.dataframe(screen_df, column_config=screener_col_cfg, use_container_width=True)
+            
+            st.download_button(
+                label="Download Screener Results as CSV",
+                data=screen_df.to_csv(index=False).encode('utf-8'),
+                file_name=f"rsi2_advanced_scan_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime='text/csv'
+            )
+        else:
+            bucket_str = ", ".join(bucket_filter)
+            st.info(f"No stocks in {universe_choice} currently match the selected criteria ({bucket_str}) with trend gates active.")
