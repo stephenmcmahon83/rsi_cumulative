@@ -37,7 +37,6 @@ def prepare_stock_data(df):
     """Computes RSI(2), 5D/10D rolling averages, preceding returns, and forward returns."""
     df = df.copy()
     
-    # Clean column MultiIndex if present
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
         
@@ -72,7 +71,6 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False):
     data = df.dropna(subset=[bucket_col, 'Fwd_5d', 'Fwd_10d', 'Fwd_15d']).copy()
     
     if fresh_entry_only:
-        # Keep only the first day entering a bucket to eliminate serial autocorrelation
         data = data[data[bucket_col] != data[bucket_col].shift(1)]
         
     labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
@@ -105,7 +103,7 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False):
         
         records.append({
             "RSI Bucket": b,
-            "Signals": n,
+            "Signals": int(n),
             "5D Win Rate (%)": wr5,
             "5D Avg Ret (%)": avg5,
             "5D Med Ret (%)": med5,
@@ -173,6 +171,12 @@ def fetch_daily_data(symbol, start, end):
         df.columns = [col[0] for col in df.columns]
     return df
 
+# Helper to apply styling in a way compatible with all Pandas versions
+def style_apply_elementwise(styler, func, subset=None):
+    if hasattr(styler, 'map'):
+        return styler.map(func, subset=subset)
+    return styler.applymap(func, subset=subset)
+
 # ==========================================
 # 3. INTERFACE LAYOUT & TABS
 # ==========================================
@@ -222,173 +226,14 @@ with tab_study:
                 "15D Win Rate (%)": "{:.1f}%", "15D Avg Ret (%)": "{:+.2f}%", "15D Med Ret (%)": "{:+.2f}%", "15D Profit Factor": "{:.2f}"
             }
             
-            # Conditional formatting: green for positive returns, red for negative
             def color_returns(val):
                 if isinstance(val, (int, float)):
                     if val > 0: return 'color: #00FF66;'
                     elif val < 0: return 'color: #FF4B4B;'
                 return ''
 
-            st.dataframe(
-                perf_table.style.format(format_dict).applymap(color_returns, subset=[
-                    "5D Avg Ret (%)", "5D Med Ret (%)", "10D Avg Ret (%)", "10D Med Ret (%)", "15D Avg Ret (%)", "15D Med Ret (%)"
-                ]),
-                use_container_width=True
-            )
-            
-            # --- Visual Win Rate & Return Bar Charts ---
-            st.subheader("📈 Forward Win Rate Comparison Across Buckets")
-            fig_wr = go.Figure()
-            fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Win Rate (%)'], name='5-Day Horizon', marker_color='#29B6F6'))
-            fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Win Rate (%)'], name='10-Day Horizon', marker_color='#66BB6A'))
-            fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['15D Win Rate (%)'], name='15-Day Horizon', marker_color='#FFA726'))
-            fig_wr.add_hline(y=50, line_dash="dash", line_color="white", annotation_text="50% Parity")
-            fig_wr.update_layout(
-                barmode='group', template="plotly_dark", yaxis_title="Win Rate (%)",
-                xaxis_title="RSI(2) Smoothed Bucket", height=420, margin=dict(l=20, r=20, t=30, b=20)
-            )
-            st.plotly_chart(fig_wr, use_container_width=True)
-
-# ----------------------------------------------------
-# TAB 2: LIVE MARKET SCREENER
-# ----------------------------------------------------
-with tab_screener:
-    st.header("Live Cumulative RSI(2) Screener")
-    st.write(
-        "Screens constituents for current RSI(2), 5-Day and 10-Day smoothed readings, and shows "
-        "preceding 5, 10, and 15-day returns alongside historical forward win rates."
-    )
-    
-    col_s1, col_s2, col_s3 = st.columns([1.2, 1.5, 1])
-    with col_s1:
-        universe_choice = st.selectbox("Screener Universe", ["S&P 500", "Nasdaq 100", "Dow Jones 30", "Major ETFs"])
-    with col_s2:
-        bucket_filter = st.multiselect(
-            "Filter Target Buckets (5-Day Avg RSI(2))",
-            options=['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100'],
-            default=['0-10', '11-20'],
-            help="Defaults to oversold capitulation regimes (0-20)."
-        )
-    with col_s3:
-        st.write("")
-        st.write("")
-        run_screener = st.button("🚀 Run Live Screen", type="primary", use_container_width=True)
-        
-    if run_screener:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        status_text.text(f"Fetching constituents for {universe_choice}...")
-        tickers = get_universe_tickers(universe_choice)
-        progress_bar.progress(15)
-        
-        status_text.text(f"Downloading market history for {len(tickers)} stocks...")
-        # Download 2 years of daily data (sufficient to compute wilders RSI, rolling avgs, prior returns, and 2yr forward edge)
-        bulk_data = yf.download(tickers, period="2y", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=True)
-        progress_bar.progress(60)
-        
-        status_text.text("Analyzing cumulative indicator regimes & preceding returns...")
-        screener_rows = []
-        
-        for sym in tickers:
-            try:
-                # Extract symbol dataframe safely
-                if len(tickers) == 1:
-                    df_sym = bulk_data.copy()
-                else:
-                    if sym in bulk_data.columns.levels[0]:
-                        df_sym = bulk_data[sym].copy().dropna(how='all')
-                    elif sym in bulk_data.columns.levels[1]:
-                        df_sym = bulk_data.xs(sym, axis=1, level=1).copy().dropna(how='all')
-                    else:
-                        continue
-                        
-                if len(df_sym) < 40:
-                    continue
-                    
-                processed = prepare_stock_data(df_sym)
-                latest = processed.iloc[-1]
-                
-                b5 = str(latest['Bucket_5d'])
-                b10 = str(latest['Bucket_10d'])
-                
-                # Filter check
-                if bucket_filter and b5 not in bucket_filter:
-                    continue
-                    
-                # Calculate quick 2-year historical forward expectancy for this symbol when in this specific 5D bucket
-                sub_hist = processed[processed['Bucket_5d'] == b5].dropna(subset=['Fwd_5d', 'Fwd_10d'])
-                if len(sub_hist) > 0:
-                    hist_5d_wr = (sub_hist['Fwd_5d'] > 0).mean() * 100
-                    hist_10d_wr = (sub_hist['Fwd_10d'] > 0).mean() * 100
-                    hist_5d_avg = sub_hist['Fwd_5d'].mean()
-                else:
-                    hist_5d_wr, hist_10d_wr, hist_5d_avg = np.nan, np.nan, np.nan
-                    
-                screener_rows.append({
-                    "Ticker": sym,
-                    "Current Price": round(latest['Adj Close'] if 'Adj Close' in latest else latest['Close'], 2),
-                    "RSI(2)": round(latest['RSI2'], 1),
-                    "5D Avg RSI(2)": round(latest['RSI2_5d_avg'], 1),
-                    "10D Avg RSI(2)": round(latest['RSI2_10d_avg'], 1),
-                    "5D Bucket": b5,
-                    "Prior 5D Ret (%)": round(latest['Prior_5d'], 2),
-                    "Prior 10D Ret (%)": round(latest['Prior_10d'], 2),
-                    "Prior 15D Ret (%)": round(latest['Prior_15d'], 2),
-                    "Hist 5D Win Rate": round(hist_5d_wr, 1) if pd.notna(hist_5d_wr) else np.nan,
-                    "Hist 10D Win Rate": round(hist_10d_wr, 1) if pd.notna(hist_10d_wr) else np.nan,
-                    "Hist 5D Avg Ret (%)": round(hist_5d_avg, 2) if pd.notna(hist_5d_avg) else np.nan
-                })
-            except Exception:
-                pass
-                
-        progress_bar.progress(100)
-        status_text.empty()
-        
-        screen_df = pd.DataFrame(screener_rows)
-        
-        if not screen_df.empty:
-            st.subheader(f"🟢 Filtered Signals: {len(screen_df)} Setups Found")
-            
-            # Default sorting: lowest 5D Avg RSI(2) first
-            screen_df = screen_df.sort_values(by="5D Avg RSI(2)", ascending=True)
-            
-            # Interactive Streamlit column configuration with tooltips
-            screener_col_cfg = {
-                "Ticker": st.column_config.TextColumn(help="Asset Ticker Symbol."),
-                "Current Price": st.column_config.NumberColumn(format="$%.2f"),
-                "RSI(2)": st.column_config.NumberColumn(help="Today's single-day RSI(2) close reading.", format="%.1f"),
-                "5D Avg RSI(2)": st.column_config.NumberColumn(help="Cumulative 5-day rolling average of daily RSI(2).", format="%.1f"),
-                "10D Avg RSI(2)": st.column_config.NumberColumn(help="Cumulative 10-day rolling average of daily RSI(2).", format="%.1f"),
-                "5D Bucket": st.column_config.TextColumn(help="10-point bucket classification of the 5-day average."),
-                "Prior 5D Ret (%)": st.column_config.NumberColumn(help="Percentage return over preceding 5 trading sessions.", format="%+.2f%%"),
-                "Prior 10D Ret (%)": st.column_config.NumberColumn(help="Percentage return over preceding 10 trading sessions.", format="%+.2f%%"),
-                "Prior 15D Ret (%)": st.column_config.NumberColumn(help="Percentage return over preceding 15 trading sessions.", format="%+.2f%%"),
-                "Hist 5D Win Rate": st.column_config.ProgressColumn(help="Historical 5-day forward win rate when this stock was in this bucket (2-year lookback).", format="%.1f%%", min_value=0, max_value=100),
-                "Hist 10D Win Rate": st.column_config.ProgressColumn(help="Historical 10-day forward win rate when this stock was in this bucket.", format="%.1f%%", min_value=0, max_value=100),
-                "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(help="Average forward 5-day percentage return from this bucket.", format="%+.2f%%")
-            }
-            
-            # Conditional color styling for prior returns
-            def highlight_prior_returns(val):
-                if isinstance(val, (int, float)):
-                    if val < 0: return 'color: #FF4B4B; font-weight: bold;'
-                    elif val > 0: return 'color: #00FF66; font-weight: bold;'
-                return ''
-
-            styled_screener = screen_df.style.applymap(
-                highlight_prior_returns,
-                subset=["Prior 5D Ret (%)", "Prior 10D Ret (%)", "Prior 15D Ret (%)", "Hist 5D Avg Ret (%)"]
-            )
-            
-            st.dataframe(styled_screener, column_config=screener_col_cfg, use_container_width=True)
-            
-            # CSV Download
-            st.download_button(
-                label="📥 Download Screener Results as CSV",
-                data=screen_df.to_csv(index=False).encode('utf-8'),
-                file_name=f"rsi2_cumulative_scan_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime='text/csv'
-            )
-        else:
-            st.info(f"No stocks in {universe_choice} currently match the selected 5-day RSI(2) buckets ({', '.join(bucket_filter)}).")
+            styled_perf = perf_table.style.format(format_dict)
+            styled_perf = style_apply_elementwise(
+                styled_perf,
+                color_returns,
+                subset=["5D Avg Ret (%)", "5D Med Ret (%)
