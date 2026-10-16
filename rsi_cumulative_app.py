@@ -15,8 +15,10 @@ st.caption(
     "Fill Rate Analytics | Multi-Stock & Universe Portfolio Backtester | Russell 2000 & S&P 500."
 )
 
-# Standardized ATR Multiplier Options (.25 to 3.0 in .25 increments)
-ATR_MULTIPLIER_OPTIONS = [0.00, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
+# Standardized ATR Multiplier Options (.00 to 3.0 in .25 increments)
+ATR_MULTIPLIER_OPTIONS = [
+    0.00, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00
+]
 
 # ==========================================
 # 1. CORE QUANTITATIVE FUNCTIONS
@@ -87,10 +89,10 @@ def prepare_stock_data(df):
     
     return df
 
-def simulate_single_ticker_execution(df, bucket_col, atr_mult=0.25, fresh_entry_only=False, require_uptrend=False):
+def simulate_single_ticker_execution(df, bucket_col, atr_mult=0.0, fresh_entry_only=False, require_uptrend=False):
     """
     Simulates Next-Day Limit Order Execution: Open - (atr_mult * ATR10).
-    Tracks fill status, dynamic exits, and MAE from entry price.
+    When atr_mult == 0.0, executes directly at the Open (Market on Open).
     """
     n = len(df)
     price_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
@@ -141,13 +143,11 @@ def simulate_single_ticker_execution(df, bucket_col, atr_mult=0.25, fresh_entry_
         }
         
         if filled:
-            # Fixed 5-Day & 10-Day Exits (evaluated from bar i+1)
             c_fwd5 = c_vals[i + 1 + 5]
             c_fwd10 = c_vals[i + 1 + 10]
             trade_data['Fwd_5d'] = (c_fwd5 - entry_price) / entry_price * 100
             trade_data['Fwd_10d'] = (c_fwd10 - entry_price) / entry_price * 100
             
-            # MAE Drawdown Tracking (Worst drop over holding period)
             min_low_5d = np.min(l_vals[i + 1 : i + 1 + 6])
             min_low_10d = np.min(l_vals[i + 1 : i + 1 + 11])
             trade_data['MAE_5d'] = min(0.0, (min_low_5d - entry_price) / entry_price * 100)
@@ -296,7 +296,6 @@ def aggregate_yearly_performance(sim_df, selected_buckets, exit_col_ret, exit_co
             "Avg Hold (Days)": round(avg_days, 1) if pd.notna(avg_days) else np.nan
         })
         
-    # Summary Totals
     tot_sigs = len(sub)
     tot_filled = sub[sub['Filled'] == True]
     all_n_filled = len(tot_filled)
@@ -333,7 +332,7 @@ def aggregate_yearly_performance(sim_df, selected_buckets, exit_col_ret, exit_co
 # ==========================================
 
 def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator_col,
-                           atr_mult=0.25, exit_mode="Close > SMA5", max_positions=5, initial_capital=100000.0,
+                           atr_mult=0.0, exit_mode="Close > SMA5", max_positions=5, initial_capital=100000.0,
                            require_uptrend=True, fresh_entry_only=True):
     """
     Day-by-day portfolio simulator supporting Next-Day Limit Orders (Open - atr_mult * ATR10).
@@ -348,12 +347,11 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
     daily_equity_records = []
     
     for d in all_dates:
-        # Step A: Attempt to Fill Pending Limit Orders from Prior Close (d)
+        # Step A: Attempt to Fill Pending Limit Orders from Prior Close
         available_slots = max_positions - len(open_positions)
         if available_slots > 0 and len(pending_orders) > 0:
             pending_orders.sort(key=lambda x: x['ind_val'])
             
-            # Current Portfolio Value for slot sizing
             current_mtm = cash
             for t_open, p_open in open_positions.items():
                 if d in prepared_dfs[t_open].index:
@@ -378,10 +376,8 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
                 o_today = row_today['Open']
                 l_today = row_today['Low']
                 
-                # Compute limit price based on today's open
                 limit_px = o_today - (atr_mult * ord_info['atr_prior'])
                 
-                # Check Fill Condition
                 if l_today <= limit_px:
                     exec_px = min(o_today, limit_px)
                     invest_amt = min(cash, target_slot_size)
@@ -400,7 +396,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
                         
             pending_orders = []
             
-        # Step B: Process Exits on Open Positions (Evaluated at close of day d)
+        # Step B: Process Exits on Open Positions
         closed_tickers = []
         for ticker, pos in open_positions.items():
             df = prepared_dfs[ticker]
@@ -450,7 +446,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
         for t in closed_tickers:
             del open_positions[t]
             
-        # Step C: Generate New Pending Limit Orders for Tomorrow's Open (d+1)
+        # Step C: Stage New Orders for Tomorrow
         for ticker, df in prepared_dfs.items():
             if ticker in open_positions or d not in df.index:
                 continue
@@ -477,7 +473,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
                 "ind_val": row[indicator_col]
             })
             
-        # Step D: Mark-to-Market Portfolio Equity at Close
+        # Step D: Mark-to-Market Portfolio Equity
         total_equity = cash
         for t_open, p_open in open_positions.items():
             if d in prepared_dfs[t_open].index:
@@ -539,7 +535,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
         all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
         all_hold = trades_df['Days Held'].mean()
     else:
-        all_wr, all_avg_ret, all_pf, all_hold = 0.0, 0.0, np.nan, 0.0
+        all_wr, all_avg_ret, all_pf, all_hold = 0.0, 0.0, np.nan, 0.0, np.nan
         
     yearly_records.append({
         "Year": "All Years",
@@ -618,7 +614,6 @@ def get_universe_tickers(universe_name):
 
 @st.cache_data(show_spinner=False)
 def fetch_daily_data(symbol, start, end):
-    """Downloads daily data with safe multi-line arguments preventing line truncation."""
     df = yf.download(
         symbol,
         start=start,
@@ -633,7 +628,6 @@ def fetch_daily_data(symbol, start, end):
     return df
 
 def extract_symbol_daily(bulk_data, sym, total_tickers):
-    """Robustly extracts single-symbol daily OHLCV from bulk yfinance downloads."""
     try:
         if total_tickers == 1:
             df = bulk_data.copy()
@@ -691,8 +685,8 @@ with tab_study:
             "Next-Day ATR(10) Limit Discount",
             options=ATR_MULTIPLIER_OPTIONS,
             index=0,
-            format_func=lambda x: f"{x:.2f} ({int(x*100)}% of ATR10)",
-            help="Subtracts X * ATR(10) from the next morning's market open price. Order fills only if Low <= Limit Price."
+            format_func=lambda x: "0.00 (Market on Open / 0% ATR)" if x == 0.0 else f"{x:.2f} ({int(x*100)}% of ATR10)",
+            help="Subtracts X * ATR(10) from the next morning's market open price. 0.00 = Market on Open. Fills only if Low <= Limit Price."
         )
     with col_t6:
         st.write("")
@@ -765,10 +759,11 @@ with tab_study:
                 c_sma_wr = perf_table.loc[curr_bucket, "SMA5 Exit Win Rate (%)"]
                 c_sma_pf = perf_table.loc[curr_bucket, "SMA5 Profit Factor"]
                 
+                desc_str = "Market on Open (0% ATR discount)" if atr_limit_mult == 0.0 else f"limit discount of **{atr_limit_mult:.2f}x ATR ({int(atr_limit_mult*100)}%)** below Open"
                 st.info(
                     f"**Empirical Baseline for Current Regime ({curr_bucket})**: "
                     f"Out of **{c_sigs} historical signals**, **{c_filled} orders filled** (**{c_fr}% Fill Rate**) "
-                    f"using a limit discount of **{atr_limit_mult:.2f}x ATR ({int(atr_limit_mult*100)}%)** below Open. "
+                    f"using a {desc_str}. "
                     f"Filled trades achieved a **5-day win rate of {c_wr}%** (Avg Return: **{c_ret:+.2f}%**). "
                     f"Exiting dynamically at Close > 5-Day SMA yielded a **{c_sma_wr}% win rate** and a **{c_sma_pf} Profit Factor**."
                 )
@@ -797,7 +792,6 @@ with tab_study:
             }
             st.dataframe(perf_table, column_config=study_col_cfg, use_container_width=True)
             
-            # Analytics Dashboard
             st.subheader("Quantitative Edge Visualizer")
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
@@ -812,13 +806,12 @@ with tab_study:
             with chart_col2:
                 fig_pf = go.Figure()
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Profit Factor'], name='Fixed 5-Day PF', marker_color='#42A5F5'))
-                fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Profit Factor'], name='SMA5 Exit PF', marker_color='#26A69A'))
+                fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit PF'], name='SMA5 Exit PF', marker_color='#26A69A'))
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit PF'], name='RSI70 Exit PF', marker_color='#FFA726'))
                 fig_pf.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Breakeven (1.0)")
                 fig_pf.update_layout(title="Profit Factor Across Buckets", barmode='group', template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
                 st.plotly_chart(fig_pf, use_container_width=True)
 
-            # Year-by-Year Breakdown
             st.divider()
             st.subheader(f"📅 Year-by-Year Performance Breakdown: {study_ticker}")
             col_y1, col_y2 = st.columns([1.5, 2.5])
@@ -904,7 +897,7 @@ with tab_watchlist:
             "Watchlist ATR(10) Discount Multiplier",
             options=ATR_MULTIPLIER_OPTIONS,
             index=0,
-            format_func=lambda x: f"{x:.2f} ({int(x*100)}% of ATR10)",
+            format_func=lambda x: "0.00 (Market on Open / 0% ATR)" if x == 0.0 else f"{x:.2f} ({int(x*100)}% of ATR10)",
             key="watch_atr_mult"
         )
     with col_w5:
@@ -942,6 +935,7 @@ with tab_watchlist:
                     is_bull = bool(latest['Above_200SMA'])
                     
                     limit_dollar_discount = watch_atr_mult * curr_atr
+                    offset_desc = "At Market Open" if watch_atr_mult == 0.0 else f"-${limit_dollar_discount:.2f} off Open ({int(watch_atr_mult*100)}% ATR)"
                     
                     sim_sub = simulate_single_ticker_execution(
                         prep_df, bucket_col=active_w_bucket_col, atr_mult=watch_atr_mult,
@@ -968,7 +962,7 @@ with tab_watchlist:
                         "Ticker": sym, "Price": round(curr_p, 2), "RSI(2)": round(latest['RSI2'], 1),
                         "5D Avg": round(latest['RSI2_5d_avg'], 1), "Active Bucket": curr_b,
                         "ATR(10)": round(curr_atr, 2),
-                        "Tomorrow Limit Offset": f"-${limit_dollar_discount:.2f} off Open ({int(watch_atr_mult*100)}% ATR)",
+                        "Tomorrow Limit Offset": offset_desc,
                         "> 200 SMA": "Yes" if is_bull else "No",
                         "Hist Signals": sigs,
                         "Hist Fill Rate": round(fr, 1) if pd.notna(fr) else 0.0,
@@ -1060,7 +1054,7 @@ with tab_portfolio:
             "Next-Day ATR(10) Limit Discount",
             options=ATR_MULTIPLIER_OPTIONS,
             index=0,
-            format_func=lambda x: f"{x:.2f} ({int(x*100)}% of ATR10)",
+            format_func=lambda x: "0.00 (Market on Open / 0% ATR)" if x == 0.0 else f"{x:.2f} ({int(x*100)}% of ATR10)",
             key="port_atr_mult"
         )
     with col_p6:
@@ -1238,7 +1232,7 @@ with tab_screener:
             "Screener ATR Discount",
             options=ATR_MULTIPLIER_OPTIONS,
             index=0,
-            format_func=lambda x: f"{x:.2f} ({int(x*100)}% ATR)",
+            format_func=lambda x: "0.00 (Open)" if x == 0.0 else f"{x:.2f} ({int(x*100)}% ATR)",
             key="screen_atr_mult"
         )
         
@@ -1313,13 +1307,14 @@ with tab_screener:
                 c_price = latest['Adj Close'] if 'Adj Close' in latest else latest['Close']
                 atr10 = latest['ATR10']
                 offset_dollars = screener_atr_mult * atr10
+                limit_target_str = "At Market Open" if screener_atr_mult == 0.0 else f"Open - ${offset_dollars:.2f}"
                 
                 screener_rows.append({
                     "Ticker": sym, "Current Price": round(c_price, 2), "RSI(2)": round(latest['RSI2'], 1),
                     "2D Avg": round(latest['RSI2_2d_avg'], 1), "3D Avg": round(latest['RSI2_3d_avg'], 1),
                     "5D Avg": round(latest['RSI2_5d_avg'], 1), "10D Avg": round(latest['RSI2_10d_avg'], 1),
                     "Active Bucket": target_b, "ATR(10)": round(atr10, 2),
-                    f"Tomorrow Limit ({int(screener_atr_mult*100)}% ATR)": f"Open - ${offset_dollars:.2f}",
+                    f"Tomorrow Limit ({int(screener_atr_mult*100)}% ATR)": limit_target_str,
                     "Above 200 SMA": "Yes" if is_above_200 else "No",
                     "Market Context": "Systemic" if latest_spy_rsi5 <= 25 else "Idiosyncratic",
                     "Prior 5D Ret (%)": round(latest['Prior_5d'], 2), "Prior 10D Ret (%)": round(latest['Prior_10d'], 2)
