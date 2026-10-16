@@ -1,303 +1,517 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
 import requests
+import re
 
-st.set_page_config(
-    page_title="Multi-Stock Monthly Reversal Backtester",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
 
-st.title("📈 Portfolio Monthly Reversal Backtester")
+st.title("Cumulative RSI(2) Quantitative Edge Platform")
 st.caption(
-    "Rules: $N$ Consecutive Red Months → Green Inside/Lower-High Signal Month → "
-    "Buy 1 Tick Above Green High → Stop Loss 1 Tick Below First Red Month's Low."
+    "Parametric Multi-Day Smoothed RSI(2) Engine | Multi-Stock Portfolio Backtester (Up to 10 Tickers) | "
+    "Year-by-Year Performance Breakdown | Dynamic Snapback Exits (SMA5, RSI70) | MAE Drawdown Tracking."
 )
 
-# --- SIDEBAR CONFIGURATION ---
-st.sidebar.header("Portfolio & Strategy Settings")
+# ==========================================
+# 1. CORE QUANTITATIVE FUNCTIONS
+# ==========================================
 
-tickers_input = st.sidebar.text_input(
-    "Stock Tickers (Up to 10, comma-separated)", 
-    value="SPY, QQQ, AAPL, MSFT"
-)
+def calculate_wilders_rsi(prices, period=2):
+    """Calculates standard Wilder's Smoothed RSI(2)."""
+    delta = prices.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(100)
 
-start_year = st.sidebar.selectbox(
-    "Start Year", 
-    options=[1995, 2000, 2005, 2010, 2015, 2020], 
-    index=1
-)
+def prepare_stock_data(df):
+    """Computes indicators, preceding momentum, fixed/dynamic exits, and MAE drawdowns."""
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
+        
+    price_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    close_s = df[price_col]
+    low_s = df['Low']
+    
+    # 1. Core Indicators & Lookback Horizons
+    df['RSI2'] = calculate_wilders_rsi(close_s, period=2)
+    df['RSI2_2d_avg'] = df['RSI2'].rolling(window=2).mean()
+    df['RSI2_3d_avg'] = df['RSI2'].rolling(window=3).mean()
+    df['RSI2_5d_avg'] = df['RSI2'].rolling(window=5).mean()
+    df['RSI2_10d_avg'] = df['RSI2'].rolling(window=10).mean()
+    
+    # 2. Trend Overlays
+    df['SMA_5'] = close_s.rolling(window=5).mean()
+    df['SMA_200'] = close_s.rolling(window=200).mean()
+    df['Above_200SMA'] = close_s > df['SMA_200']
+    
+    # 3. Preceding Returns (Trailing Momentum)
+    df['Prior_5d'] = (close_s - close_s.shift(5)) / close_s.shift(5) * 100
+    df['Prior_10d'] = (close_s - close_s.shift(10)) / close_s.shift(10) * 100
+    df['Prior_15d'] = (close_s - close_s.shift(15)) / close_s.shift(15) * 100
+    
+    # 4. Fixed Forward Returns
+    df['Fwd_5d'] = (close_s.shift(-5) - close_s) / close_s * 100
+    df['Fwd_10d'] = (close_s.shift(-10) - close_s) / close_s * 100
+    df['Fwd_15d'] = (close_s.shift(-15) - close_s) / close_s * 100
+    
+    # 5. True Maximum Adverse Excursion (MAE)
+    min_low_5d = low_s.iloc[::-1].rolling(5).min().shift(1).iloc[::-1]
+    min_low_10d = low_s.iloc[::-1].rolling(10).min().shift(1).iloc[::-1]
+    
+    raw_mae_5d = (min_low_5d - close_s) / close_s * 100
+    raw_mae_10d = (min_low_10d - close_s) / close_s * 100
+    
+    df['MAE_5d'] = raw_mae_5d.clip(upper=0.0)
+    df['MAE_10d'] = raw_mae_10d.clip(upper=0.0)
+    
+    # 6. Dynamic Snapback Exits
+    n = len(df)
+    c_vals = close_s.values
+    sma5_vals = df['SMA_5'].values
+    rsi_vals = df['RSI2'].values
+    
+    fwd_sma5_ret = np.full(n, np.nan)
+    fwd_sma5_days = np.full(n, np.nan)
+    fwd_rsi70_ret = np.full(n, np.nan)
+    fwd_rsi70_days = np.full(n, np.nan)
+    
+    for i in range(n - 15):
+        c0 = c_vals[i]
+        
+        # Exit on Close > 5-Day SMA
+        for k in range(1, 16):
+            if c_vals[i + k] > sma5_vals[i + k]:
+                fwd_sma5_ret[i] = (c_vals[i + k] - c0) / c0 * 100
+                fwd_sma5_days[i] = k
+                break
+        else:
+            fwd_sma5_ret[i] = (c_vals[i + 15] - c0) / c0 * 100
+            fwd_sma5_days[i] = 15
+            
+        # Exit on RSI(2) > 70
+        for k in range(1, 16):
+            if rsi_vals[i + k] > 70:
+                fwd_rsi70_ret[i] = (c_vals[i + k] - c0) / c0 * 100
+                fwd_rsi70_days[i] = k
+                break
+        else:
+            fwd_rsi70_ret[i] = (c_vals[i + 15] - c0) / c0 * 100
+            fwd_rsi70_days[i] = 15
+            
+    df['Fwd_SMA5_Ret'] = fwd_sma5_ret
+    df['Fwd_SMA5_Days'] = fwd_sma5_days
+    df['Fwd_RSI70_Ret'] = fwd_rsi70_ret
+    df['Fwd_RSI70_Days'] = fwd_rsi70_days
+    
+    # 7. Discrete 10-Point Bucketing
+    bins = [-0.001, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.001]
+    labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
+    
+    df['Bucket_2d'] = pd.cut(df['RSI2_2d_avg'], bins=bins, labels=labels)
+    df['Bucket_3d'] = pd.cut(df['RSI2_3d_avg'], bins=bins, labels=labels)
+    df['Bucket_5d'] = pd.cut(df['RSI2_5d_avg'], bins=bins, labels=labels)
+    df['Bucket_10d'] = pd.cut(df['RSI2_10d_avg'], bins=bins, labels=labels)
+    
+    return df
 
-consec_red_target = st.sidebar.slider(
-    "Min Consecutive Red Months", 
-    min_value=2, 
-    max_value=8, 
-    value=3
-)
+def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require_uptrend=False):
+    """Aggregates win rate, return distributions, average MAE, and profit factor by bucket."""
+    data = df.dropna(subset=[bucket_col, 'Fwd_5d', 'Fwd_10d', 'Fwd_15d']).copy()
+    
+    if require_uptrend:
+        data = data[data['Above_200SMA'] == True]
+        
+    if fresh_entry_only:
+        data = data[data[bucket_col] != data[bucket_col].shift(1)]
+        
+    labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
+    records = []
+    
+    for b in labels:
+        sub = data[data[bucket_col] == b]
+        n = len(sub)
+        if n == 0:
+            records.append({
+                "RSI Bucket": b, "Signals": 0,
+                "5D Win Rate (%)": 0.0, "5D Avg Ret (%)": 0.0, "5D Avg Drawdown (%)": 0.0, "5D Profit Factor": 0.0,
+                "10D Win Rate (%)": 0.0, "10D Avg Ret (%)": 0.0, "10D Avg Drawdown (%)": 0.0, "10D Profit Factor": 0.0,
+                "SMA5 Exit Win Rate (%)": 0.0, "SMA5 Exit Avg Ret (%)": 0.0, "SMA5 Avg Hold (Days)": 0.0, "SMA5 Profit Factor": 0.0,
+                "RSI70 Exit Win Rate (%)": 0.0, "RSI70 Exit Avg Ret (%)": 0.0, "RSI70 Avg Hold (Days)": 0.0, "RSI70 Profit Factor": 0.0
+            })
+            continue
+            
+        def stats_fixed(ret_series, mae_series):
+            wr = (ret_series > 0).mean() * 100
+            avg_r = ret_series.mean()
+            avg_mae = mae_series.mean()
+            gains = ret_series[ret_series > 0].sum()
+            losses = abs(ret_series[ret_series < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            return round(wr, 1), round(avg_r, 2), round(avg_mae, 2), pf
+            
+        def stats_dynamic(ret_series, days_series):
+            wr = (ret_series > 0).mean() * 100
+            avg_r = ret_series.mean()
+            avg_d = days_series.mean()
+            gains = ret_series[ret_series > 0].sum()
+            losses = abs(ret_series[ret_series < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            return round(wr, 1), round(avg_r, 2), round(avg_d, 1), pf
+            
+        wr5, avg5, mae5, pf5 = stats_fixed(sub['Fwd_5d'], sub['MAE_5d'])
+        wr10, avg10, mae10, pf10 = stats_fixed(sub['Fwd_10d'], sub['MAE_10d'])
+        wr_sma, avg_sma, days_sma, pf_sma = stats_dynamic(sub['Fwd_SMA5_Ret'], sub['Fwd_SMA5_Days'])
+        wr_rsi, avg_rsi, days_rsi, pf_rsi = stats_dynamic(sub['Fwd_RSI70_Ret'], sub['Fwd_RSI70_Days'])
+        
+        records.append({
+            "RSI Bucket": b,
+            "Signals": int(n),
+            "5D Win Rate (%)": wr5,
+            "5D Avg Ret (%)": avg5,
+            "5D Avg Drawdown (%)": mae5,
+            "5D Profit Factor": pf5,
+            "10D Win Rate (%)": wr10,
+            "10D Avg Ret (%)": avg10,
+            "10D Avg Drawdown (%)": mae10,
+            "10D Profit Factor": pf10,
+            "SMA5 Exit Win Rate (%)": wr_sma,
+            "SMA5 Exit Avg Ret (%)": avg_sma,
+            "SMA5 Avg Hold (Days)": days_sma,
+            "SMA5 Profit Factor": pf_sma,
+            "RSI70 Exit Win Rate (%)": wr_rsi,
+            "RSI70 Exit Avg Ret (%)": avg_rsi,
+            "RSI70 Avg Hold (Days)": days_rsi,
+            "RSI70 Profit Factor": pf_rsi
+        })
+        
+    return pd.DataFrame(records).set_index("RSI Bucket")
 
-hold_months = st.sidebar.slider(
-    "Hold Duration (Months)", 
-    min_value=1, 
-    max_value=12, 
-    value=3
-)
+def aggregate_yearly_performance(df, bucket_col, selected_buckets, exit_col_ret, exit_col_days=None, require_uptrend=False, fresh_entry_only=False):
+    """Calculates yearly breakdown metrics for an asset under chosen bucket and exit criteria."""
+    data = df.dropna(subset=[bucket_col, exit_col_ret]).copy()
+    
+    if require_uptrend:
+        data = data[data['Above_200SMA'] == True]
+        
+    if fresh_entry_only:
+        data = data[data[bucket_col] != data[bucket_col].shift(1)]
+        
+    data = data[data[bucket_col].astype(str).isin(selected_buckets)]
+    
+    if data.empty:
+        return pd.DataFrame()
+        
+    data['Year'] = data.index.year
+    records = []
+    
+    for yr, group in data.groupby('Year'):
+        n_sigs = len(group)
+        ret_s = group[exit_col_ret]
+        
+        wr = (ret_s > 0).mean() * 100
+        avg_ret = ret_s.mean()
+        
+        gains = ret_s[ret_s > 0].sum()
+        losses = abs(ret_s[ret_s < 0].sum())
+        pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
+        
+        comp_ret = ((1 + ret_s / 100).prod() - 1) * 100
+        avg_days = group[exit_col_days].mean() if exit_col_days and exit_col_days in group else np.nan
+        
+        records.append({
+            "Year": str(yr),
+            "Signals": int(n_sigs),
+            "Win Rate (%)": round(wr, 1),
+            "Avg Return (%)": round(avg_ret, 2),
+            "Profit Factor": pf,
+            "Annual Compounded Ret (%)": round(comp_ret, 2),
+            "Avg Hold (Days)": round(avg_days, 1) if pd.notna(avg_days) else np.nan
+        })
+        
+    all_ret = data[exit_col_ret]
+    all_gains = all_ret[all_ret > 0].sum()
+    all_losses = abs(all_ret[all_ret < 0].sum())
+    all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
+    all_comp = ((1 + all_ret / 100).prod() - 1) * 100
+    all_days = data[exit_col_days].mean() if exit_col_days and exit_col_days in data else np.nan
 
-# Parse and clean tickers
-raw_tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
-selected_tickers = raw_tickers[:10]  # Cap at 10
-
-if len(raw_tickers) > 10:
-    st.sidebar.warning(f"Capped at 10 tickers. Evaluating: {', '.join(selected_tickers)}")
-
-
-# --- DATA FETCHING WITH CACHE & CUSTOM USER-AGENT ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_stock_data(ticker_sym, start_yr):
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    records.append({
+        "Year": "All Years",
+        "Signals": int(len(data)),
+        "Win Rate (%)": round((all_ret > 0).mean() * 100, 1),
+        "Avg Return (%)": round(all_ret.mean(), 2),
+        "Profit Factor": all_pf,
+        "Annual Compounded Ret (%)": round(all_comp, 2),
+        "Avg Hold (Days)": round(all_days, 1) if pd.notna(all_days) else np.nan
     })
+    
+    return pd.DataFrame(records).set_index("Year")
 
-    ticker_obj = yf.Ticker(ticker_sym, session=session)
-    monthly_df = ticker_obj.history(start=f"{start_yr}-01-01", interval="1mo")
-    daily_df = ticker_obj.history(start=f"{start_yr}-01-01", interval="1d")
+# ==========================================
+# 2. MULTI-STOCK PORTFOLIO ENGINE
+# ==========================================
 
-    if monthly_df.empty or daily_df.empty:
-        monthly_df = yf.download(ticker_sym, start=f"{start_yr}-01-01", interval="1mo", progress=False)
-        daily_df = yf.download(ticker_sym, start=f"{start_yr}-01-01", interval="1d", progress=False)
+def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator_col,
+                           exit_mode="Close > SMA5", max_positions=5, initial_capital=100000.0,
+                           require_uptrend=True, fresh_entry_only=True):
+    """
+    Day-by-day multi-stock portfolio simulation.
+    Handles position sizing, cash management, signal ranking, exits, and annual accounting.
+    """
+    # 1. Align common date timeline
+    all_dates = sorted(list(set.union(*[set(df.index) for df in prepared_dfs.values()])))
+    
+    cash = float(initial_capital)
+    open_positions = {}  # {ticker: {'entry_date': d, 'entry_price': p, 'shares': s, 'cost_basis': c, 'days_held': 0}}
+    trade_log = []
+    daily_equity_records = []
+    
+    for d in all_dates:
+        # Step A: Process Exits on Open Positions
+        closed_tickers = []
+        for ticker, pos in open_positions.items():
+            df = prepared_dfs[ticker]
+            if d not in df.index:
+                pos['days_held'] += 1
+                continue
+                
+            row = df.loc[d]
+            c_price = row['Adj Close'] if 'Adj Close' in row else row['Close']
+            pos['days_held'] += 1
+            
+            exit_hit = False
+            exit_reason = ""
+            
+            if exit_mode == "Close > SMA5" and c_price > row['SMA_5']:
+                exit_hit = True
+                exit_reason = "Close > SMA5"
+            elif exit_mode == "RSI(2) > 70" and row['RSI2'] >= 70:
+                exit_hit = True
+                exit_reason = "RSI(2) >= 70"
+            elif exit_mode == "Fixed 5-Day Hold" and pos['days_held'] >= 5:
+                exit_hit = True
+                exit_reason = "5-Day Limit"
+            elif exit_mode == "Fixed 10-Day Hold" and pos['days_held'] >= 10:
+                exit_hit = True
+                exit_reason = "10-Day Limit"
+                
+            if exit_hit:
+                proceeds = pos['shares'] * c_price
+                cash += proceeds
+                trade_ret = (c_price - pos['entry_price']) / pos['entry_price'] * 100
+                
+                trade_log.append({
+                    "Ticker": ticker,
+                    "Entry Date": pos['entry_date'].strftime('%Y-%m-%d'),
+                    "Entry Price": round(pos['entry_price'], 2),
+                    "Exit Date": d.strftime('%Y-%m-%d'),
+                    "Exit Price": round(c_price, 2),
+                    "Exit Reason": exit_reason,
+                    "Return (%)": round(trade_ret, 2),
+                    "Days Held": pos['days_held'],
+                    "Year": d.year,
+                    "Result": "Win" if trade_ret > 0 else "Loss"
+                })
+                closed_tickers.append(ticker)
+                
+        for t in closed_tickers:
+            del open_positions[t]
+            
+        # Step B: Identify Candidate Entries Across Available Tickers
+        candidates = []
+        available_slots = max_positions - len(open_positions)
+        
+        for ticker, df in prepared_dfs.items():
+            if ticker in open_positions or d not in df.index:
+                continue
+                
+            row = df.loc[d]
+            current_bucket = str(row[bucket_col])
+            
+            if current_bucket not in selected_buckets:
+                continue
+                
+            if require_uptrend and not bool(row['Above_200SMA']):
+                continue
+                
+            if fresh_entry_only:
+                prev_loc = df.index.get_loc(d) - 1
+                if prev_loc >= 0:
+                    prev_bucket = str(df.iloc[prev_loc][bucket_col])
+                    if current_bucket == prev_bucket:
+                        continue
+                        
+            c_price = row['Adj Close'] if 'Adj Close' in row else row['Close']
+            ind_val = row[indicator_col]
+            candidates.append({
+                "ticker": ticker,
+                "price": c_price,
+                "ind_val": ind_val
+            })
+            
+        # Rank by lowest indicator value (deepest oversold first)
+        candidates.sort(key=lambda x: x['ind_val'])
+        
+        # Step C: Allocate Capital to Slots
+        if available_slots > 0 and len(candidates) > 0:
+            # Current portfolio value at market close
+            current_mtm = cash
+            for t_open, p_open in open_positions.items():
+                if d in prepared_dfs[t_open].index:
+                    cur_px = prepared_dfs[t_open].loc[d]['Adj Close'] if 'Adj Close' in prepared_dfs[t_open].loc[d] else prepared_dfs[t_open].loc[d]['Close']
+                    current_mtm += p_open['shares'] * cur_px
+                else:
+                    current_mtm += p_open['shares'] * p_open['entry_price']
+                    
+            target_slot_size = current_mtm / max_positions
+            
+            for cand in candidates[:available_slots]:
+                invest_amt = min(cash, target_slot_size)
+                if invest_amt >= 250.0:  # Minimum viable allocation
+                    shares = invest_amt / cand['price']
+                    cash -= invest_amt
+                    open_positions[cand['ticker']] = {
+                        'entry_date': d,
+                        'entry_price': cand['price'],
+                        'shares': shares,
+                        'cost_basis': invest_amt,
+                        'days_held': 0
+                    }
+                    
+        # Step D: Mark-to-Market Total Portfolio Value
+        total_equity = cash
+        for t_open, p_open in open_positions.items():
+            if d in prepared_dfs[t_open].index:
+                cur_px = prepared_dfs[t_open].loc[d]['Adj Close'] if 'Adj Close' in prepared_dfs[t_open].loc[d] else prepared_dfs[t_open].loc[d]['Close']
+                total_equity += p_open['shares'] * cur_px
+            else:
+                total_equity += p_open['shares'] * p_open['entry_price']
+                
+        daily_equity_records.append({"Date": d, "Equity": total_equity})
+        
+    equity_df = pd.DataFrame(daily_equity_records).set_index("Date")
+    trades_df = pd.DataFrame(trade_log)
+    
+    # Step E: Aggregate Year-by-Year Portfolio Metrics
+    equity_df['Year'] = equity_df.index.year
+    yearly_records = []
+    
+    for yr, grp in equity_df.groupby('Year'):
+        start_eq = grp['Equity'].iloc[0]
+        end_eq = grp['Equity'].iloc[-1]
+        yr_return = ((end_eq / start_eq) - 1) * 100
+        
+        # Max Drawdown within year
+        cummax = grp['Equity'].cummax()
+        yr_dd = ((grp['Equity'] - cummax) / cummax).min() * 100
+        
+        # Trade log statistics for this year
+        yr_trades = trades_df[trades_df['Year'] == yr] if not trades_df.empty else pd.DataFrame()
+        n_trades = len(yr_trades)
+        
+        if n_trades > 0:
+            win_rate = (yr_trades['Result'] == 'Win').mean() * 100
+            avg_trade_ret = yr_trades['Return (%)'].mean()
+            gains = yr_trades[yr_trades['Return (%)'] > 0]['Return (%)'].sum()
+            losses = abs(yr_trades[yr_trades['Return (%)'] < 0]['Return (%)'].sum())
+            pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
+            avg_days = yr_trades['Days Held'].mean()
+        else:
+            win_rate, avg_trade_ret, pf, avg_days = 0.0, 0.0, np.nan, 0.0
+            
+        yearly_records.append({
+            "Year": str(yr),
+            "Trades": int(n_trades),
+            "Win Rate (%)": round(win_rate, 1),
+            "Avg Trade Ret (%)": round(avg_trade_ret, 2),
+            "Profit Factor": pf,
+            "Annual Portfolio Ret (%)": round(yr_return, 2),
+            "Max Drawdown (%)": round(yr_dd, 1),
+            "Avg Hold (Days)": round(avg_days, 1)
+        })
+        
+    # Overall Summary Row
+    tot_ret = ((equity_df['Equity'].iloc[-1] / initial_capital) - 1) * 100
+    overall_cummax = equity_df['Equity'].cummax()
+    overall_dd = ((equity_df['Equity'] - overall_cummax) / overall_cummax).min() * 100
+    
+    if not trades_df.empty:
+        all_wr = (trades_df['Result'] == 'Win').mean() * 100
+        all_avg_ret = trades_df['Return (%)'].mean()
+        all_gains = trades_df[trades_df['Return (%)'] > 0]['Return (%)'].sum()
+        all_losses = abs(trades_df[trades_df['Return (%)'] < 0]['Return (%)'].sum())
+        all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
+        all_hold = trades_df['Days Held'].mean()
+    else:
+        all_wr, all_avg_ret, all_pf, all_hold = 0.0, 0.0, np.nan, 0.0
+        
+    yearly_records.append({
+        "Year": "All Years",
+        "Trades": int(len(trades_df)),
+        "Win Rate (%)": round(all_wr, 1),
+        "Avg Trade Ret (%)": round(all_avg_ret, 2),
+        "Profit Factor": all_pf,
+        "Annual Portfolio Ret (%)": round(tot_ret, 2),
+        "Max Drawdown (%)": round(overall_dd, 1),
+        "Avg Hold (Days)": round(all_hold, 1)
+    })
+    
+    yearly_summary_df = pd.DataFrame(yearly_records).set_index("Year")
+    return yearly_summary_df, equity_df, trades_df
 
-    return monthly_df, daily_df
+# ==========================================
+# 3. UNIVERSE FETCHERS & PARSERS
+# ==========================================
 
+DJIA_STATIC_FALLBACK = [
+    "AAPL", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS", "GS",
+    "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
+    "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT"
+]
 
-# --- SINGLE-ASSET BACKTEST LOGIC ---
-def backtest_single_stock(ticker_sym, monthly_raw, daily_raw, red_target, hold_len):
-    monthly_df = monthly_raw.copy()
-    daily_df = daily_raw.copy()
-
-    for df in [monthly_df, daily_df]:
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-    if monthly_df.index.tz is not None:
-        monthly_df.index = monthly_df.index.tz_localize(None)
-    if daily_df.index.tz is not None:
-        daily_df.index = daily_df.index.tz_localize(None)
-
-    monthly_df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
-    daily_df.dropna(subset=['Open', 'High', 'Low', 'Close'], inplace=True)
-
-    if len(monthly_df) < red_target + 2 or daily_df.empty:
+@st.cache_data(show_spinner=False, ttl=86400)
+def get_universe_tickers(universe_name):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"}
+    
+    def extract_wiki(url):
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                for df in pd.read_html(resp.text):
+                    for col in ['Symbol', 'Ticker']:
+                        if col in df.columns:
+                            return [s.replace('.', '-') for s in df[col].dropna().astype(str).tolist()]
+        except Exception:
+            pass
         return []
 
-    monthly_df['Is_Red'] = monthly_df['Close'] < monthly_df['Open']
-    monthly_df['Is_Green'] = monthly_df['Close'] > monthly_df['Open']
-    monthly_df['Consec_Red'] = monthly_df['Is_Red'].groupby((~monthly_df['Is_Red']).cumsum()).cumsum()
+    if universe_name == "S&P 500":
+        res = extract_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        if not res:
+            try:
+                res = pd.read_csv("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv")['Symbol'].tolist()
+            except Exception: pass
+        return res
+    elif universe_name == "Nasdaq 100":
+        res = extract_wiki("https://en.wikipedia.org/wiki/Nasdaq-100")
+        return res if res else ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "COST", "AMD"]
+    elif universe_name == "Dow Jones 30":
+        res = extract_wiki("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
+        return res if res else DJIA_STATIC_FALLBACK
+    elif universe_name == "Major ETFs":
+        return ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "SMH", "TLT", "GLD"]
+    return []
 
-    trades = []
-
-    for i in range(len(monthly_df)):
-        if i < red_target + 1:
-            continue
-
-        was_green_signal = bool(monthly_df['Is_Green'].iloc[i - 1])
-        actual_red_streak = int(monthly_df['Consec_Red'].iloc[i - 2])
-        had_enough_reds = actual_red_streak >= red_target
-        lower_high_filter = float(monthly_df['High'].iloc[i - 1]) < float(monthly_df['High'].iloc[i - 2])
-
-        if was_green_signal and had_enough_reds and lower_high_filter:
-            first_red_idx = (i - 2) - actual_red_streak + 1
-
-            tick = 0.01
-            buy_trigger = float(monthly_df['High'].iloc[i - 1] + tick)
-            stop_loss_level = float(monthly_df['Low'].iloc[first_red_idx] - tick)
-
-            exec_month_start = monthly_df.index[i]
-            exec_month_end = monthly_df.index[i + 1] if (i + 1 < len(monthly_df)) else daily_df.index[-1]
-
-            execution_days = daily_df[(daily_df.index >= exec_month_start) & (daily_df.index < exec_month_end)]
-            triggered_days = execution_days[execution_days['High'] >= buy_trigger]
-
-            if triggered_days.empty:
-                continue
-
-            entry_date = triggered_days.index[0]
-            entry_day_data = daily_df.loc[entry_date]
-            entry_price = max(buy_trigger, float(entry_day_data['Open']))
-
-            exit_month_idx = i + hold_len
-            max_hold_date = monthly_df.index[exit_month_idx] if (exit_month_idx < len(monthly_df)) else daily_df.index[-1]
-
-            trade_lifecycle = daily_df[(daily_df.index >= entry_date) & (daily_df.index <= max_hold_date)]
-
-            exited = False
-            for current_date, row in trade_lifecycle.iterrows():
-                # Same-day execution stop check
-                if current_date == entry_date:
-                    if float(row['Low']) <= stop_loss_level:
-                        exit_price = stop_loss_level
-                        trades.append({
-                            'Ticker': ticker_sym,
-                            'Year': current_date.year,
-                            'Entry Date': entry_date.strftime('%Y-%m-%d'),
-                            'Exit Date': current_date.strftime('%Y-%m-%d'),
-                            'Entry ($)': round(entry_price, 2),
-                            'Exit ($)': round(exit_price, 2),
-                            'Return (%)': round(((exit_price - entry_price) / entry_price) * 100, 2),
-                            'Exit Type': 'Stopped Out (Day 1)'
-                        })
-                        exited = True
-                        break
-                    continue
-
-                # Normal daily stop against first red month's low
-                if float(row['Low']) <= stop_loss_level:
-                    exit_price = min(stop_loss_level, float(row['Open']))
-                    trades.append({
-                        'Ticker': ticker_sym,
-                        'Year': current_date.year,
-                        'Entry Date': entry_date.strftime('%Y-%m-%d'),
-                        'Exit Date': current_date.strftime('%Y-%m-%d'),
-                        'Entry ($)': round(entry_price, 2),
-                        'Exit ($)': round(exit_price, 2),
-                        'Return (%)': round(((exit_price - entry_price) / entry_price) * 100, 2),
-                        'Exit Type': 'Stopped Out (First Red Low)'
-                    })
-                    exited = True
-                    break
-
-                # Target time horizon exit
-                if current_date == max_hold_date:
-                    exit_price = float(row['Close'])
-                    trades.append({
-                        'Ticker': ticker_sym,
-                        'Year': current_date.year,
-                        'Entry Date': entry_date.strftime('%Y-%m-%d'),
-                        'Exit Date': current_date.strftime('%Y-%m-%d'),
-                        'Entry ($)': round(entry_price, 2),
-                        'Exit ($)': round(exit_price, 2),
-                        'Return (%)': round(((exit_price - entry_price) / entry_price) * 100, 2),
-                        'Exit Type': 'Time Exit'
-                    })
-                    exited = True
-                    break
-
-            if not exited and not trade_lifecycle.empty:
-                last_row = trade_lifecycle.iloc[-1]
-                trades.append({
-                    'Ticker': ticker_sym,
-                    'Year': trade_lifecycle.index[-1].year,
-                    'Entry Date': entry_date.strftime('%Y-%m-%d'),
-                    'Exit Date': trade_lifecycle.index[-1].strftime('%Y-%m-%d'),
-                    'Entry ($)': round(entry_price, 2),
-                    'Exit ($)': round(float(last_row['Close']), 2),
-                    'Return (%)': round(((float(last_row['Close']) - entry_price) / entry_price) * 100, 2),
-                    'Exit Type': 'End of Data'
-                })
-
-    return trades
-
-
-# --- EXECUTION & DASHBOARD ---
-if not selected_tickers:
-    st.info("Please enter at least 1 valid stock ticker in the sidebar.")
-else:
-    all_portfolio_trades = []
-    loading_progress = st.progress(0, text="Fetching data and running simulations...")
-
-    for idx, sym in enumerate(selected_tickers):
-        loading_progress.progress((idx + 1) / len(selected_tickers), text=f"Analyzing {sym} ({idx+1}/{len(selected_tickers)})...")
-        try:
-            m_raw, d_raw = fetch_stock_data(sym, start_year)
-            if not m_raw.empty and not d_raw.empty:
-                stock_trades = backtest_single_stock(sym, m_raw, d_raw, consec_red_target, hold_months)
-                all_portfolio_trades.extend(stock_trades)
-        except Exception as e:
-            st.warning(f"Error evaluating {sym}: {e}")
-
-    loading_progress.empty()
-
-    if all_portfolio_trades:
-        df_trades = pd.DataFrame(all_portfolio_trades)
-
-        # 1. Top-Level Portfolio Metrics
-        total_trades = len(df_trades)
-        win_trades = (df_trades['Return (%)'] > 0).sum()
-        win_rate = (win_trades / total_trades) * 100
-        avg_trade_ret = df_trades['Return (%)'].mean()
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Portfolio Trades", total_trades)
-        m2.metric("Overall Win Rate", f"{win_rate:.1f}%")
-        m3.metric("Avg Trade Return", f"{avg_trade_ret:.2f}%")
-        m4.metric("Tickers Traded", f"{df_trades['Ticker'].nunique()} / {len(selected_tickers)}")
-
-        st.divider()
-
-        # 2. Year-by-Year Performance Breakdown
-        st.subheader("📅 Year-by-Year Performance")
-
-        annual_summary = []
-        for year, group in df_trades.groupby('Year'):
-            y_total = len(group)
-            y_wins = (group['Return (%)'] > 0).sum()
-            y_losses = y_total - y_wins
-            y_winrate = (y_wins / y_total) * 100
-            y_avg_ret = group['Return (%)'].mean()
-            # Compounded return across all trades closed in that year
-            y_compounded = (np.prod(1 + (group['Return (%)'] / 100)) - 1) * 100
-
-            annual_summary.append({
-                'Year': int(year),
-                'Trades': y_total,
-                'Wins': y_wins,
-                'Losses': y_losses,
-                'Win Rate (%)': round(y_winrate, 1),
-                'Avg Trade Ret (%)': round(y_avg_ret, 2),
-                'Cumulative Annual Ret (%)': round(y_compounded, 2)
-            })
-
-        df_annual = pd.DataFrame(annual_summary).sort_values('Year', ascending=False)
-        st.dataframe(df_annual, width="stretch", hide_index=True)
-
-        st.divider()
-
-        # 3. Individual Ticker Breakdown
-        st.subheader("📊 Performance by Ticker")
-        ticker_summary = []
-        for sym, group in df_trades.groupby('Ticker'):
-            t_total = len(group)
-            t_wins = (group['Return (%)'] > 0).sum()
-            t_winrate = (t_wins / t_total) * 100
-            t_avg_ret = group['Return (%)'].mean()
-
-            ticker_summary.append({
-                'Ticker': sym,
-                'Trades': t_total,
-                'Win Rate (%)': round(t_winrate, 1),
-                'Avg Trade Ret (%)': round(t_avg_ret, 2)
-            })
-
-        df_ticker_perf = pd.DataFrame(ticker_summary).sort_values('Trades', ascending=False)
-        st.dataframe(df_ticker_perf, width="stretch", hide_index=True)
-
-        st.divider()
-
-        # 4. Filterable Global Trade Log
-        st.subheader("📋 Comprehensive Trade Log")
-        selected_log_filter = st.selectbox("Filter trade log by Ticker", options=["ALL"] + sorted(list(df_trades['Ticker'].unique())))
-        
-        if selected_log_filter == "ALL":
-            st.dataframe(df_trades.sort_values('Exit Date', ascending=False), width="stretch", hide_index=True)
-        else:
-            filtered_df = df_trades[df_trades['Ticker'] == selected_log_filter].sort_values('Exit Date', ascending=False)
-            st.dataframe(filtered_df, width="stretch", hide_index=True)
-
-    else:
-        st.info(
-            f"No trades triggered across any of the selected tickers ({', '.join(selected_tickers)}) "
-            f"under the current parameters (Streak ≥ {consec_red_target} red months). "
-            "Try adjusting the required red months or expanding the ticker list."
-        )
+@st.cache_data(show_spinner=False)
+def fetch_daily_data(symbol, start, end):
+    df = yf.download(symbol, start=start, end
