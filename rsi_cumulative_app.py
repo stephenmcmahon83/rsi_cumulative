@@ -11,12 +11,12 @@ st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
 
 st.title("Cumulative RSI(2) Quantitative Edge Platform")
 st.caption(
-    "Parametric Multi-Day Smoothed RSI(2) Engine | Next-Day Limit Order Execution (.25 to 3.0 ATR) | "
+    "Parametric Multi-Day Smoothed RSI(2) Engine | Next-Day Limit Order Execution (.00 to 3.0 ATR) | "
     "Fill Rate Analytics | Multi-Stock & Universe Portfolio Backtester | Russell 2000 & S&P 500."
 )
 
 # Standardized ATR Multiplier Options (.25 to 3.0 in .25 increments)
-ATR_MULTIPLIER_OPTIONS = [0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
+ATR_MULTIPLIER_OPTIONS = [0.00, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 2.75, 3.00]
 
 # ==========================================
 # 1. CORE QUANTITATIVE FUNCTIONS
