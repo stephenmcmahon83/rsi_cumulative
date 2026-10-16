@@ -11,8 +11,8 @@ st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
 
 st.title("Cumulative RSI(2) Quantitative Edge Platform")
 st.caption(
-    "Parametric Multi-Day Smoothed RSI(2) Engine | Universe & Multi-Stock Portfolio Backtester | "
-    "Russell 2000 & S&P 500 Coverage | Year-by-Year Auditing | Dynamic Snapback Exits."
+    "Parametric Multi-Day Smoothed RSI(2) Engine | Next-Day Open Limit Order Execution (ATR Scaled) | "
+    "Fill Rate Analytics | Multi-Stock & Universe Portfolio Backtester | Russell 2000 & S&P 500."
 )
 
 # ==========================================
@@ -32,15 +32,28 @@ def calculate_wilders_rsi(prices, period=2):
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(100)
 
+def calculate_atr(df, period=10):
+    """Calculates Wilder's Average True Range (ATR)."""
+    price_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    prev_close = df[price_col].shift(1)
+    high = df['High']
+    low = df['Low']
+    
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    return atr
+
 def prepare_stock_data(df):
-    """Computes indicators, preceding momentum, fixed/dynamic exits, and MAE drawdowns."""
+    """Computes technical indicators, moving averages, preceding momentum, and ATR(10)."""
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
         
     price_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
     close_s = df[price_col]
-    low_s = df['Low']
     
     # 1. Core Indicators & Lookback Horizons
     df['RSI2'] = calculate_wilders_rsi(close_s, period=2)
@@ -48,6 +61,7 @@ def prepare_stock_data(df):
     df['RSI2_3d_avg'] = df['RSI2'].rolling(window=3).mean()
     df['RSI2_5d_avg'] = df['RSI2'].rolling(window=5).mean()
     df['RSI2_10d_avg'] = df['RSI2'].rolling(window=10).mean()
+    df['ATR10'] = calculate_atr(df, period=10)
     
     # 2. Trend Overlays
     df['SMA_5'] = close_s.rolling(window=5).mean()
@@ -59,61 +73,7 @@ def prepare_stock_data(df):
     df['Prior_10d'] = (close_s - close_s.shift(10)) / close_s.shift(10) * 100
     df['Prior_15d'] = (close_s - close_s.shift(15)) / close_s.shift(15) * 100
     
-    # 4. Fixed Forward Returns
-    df['Fwd_5d'] = (close_s.shift(-5) - close_s) / close_s * 100
-    df['Fwd_10d'] = (close_s.shift(-10) - close_s) / close_s * 100
-    df['Fwd_15d'] = (close_s.shift(-15) - close_s) / close_s * 100
-    
-    # 5. True Maximum Adverse Excursion (MAE)
-    min_low_5d = low_s.iloc[::-1].rolling(5).min().shift(1).iloc[::-1]
-    min_low_10d = low_s.iloc[::-1].rolling(10).min().shift(1).iloc[::-1]
-    
-    raw_mae_5d = (min_low_5d - close_s) / close_s * 100
-    raw_mae_10d = (min_low_10d - close_s) / close_s * 100
-    
-    df['MAE_5d'] = raw_mae_5d.clip(upper=0.0)
-    df['MAE_10d'] = raw_mae_10d.clip(upper=0.0)
-    
-    # 6. Dynamic Snapback Exits
-    n = len(df)
-    c_vals = close_s.values
-    sma5_vals = df['SMA_5'].values
-    rsi_vals = df['RSI2'].values
-    
-    fwd_sma5_ret = np.full(n, np.nan)
-    fwd_sma5_days = np.full(n, np.nan)
-    fwd_rsi70_ret = np.full(n, np.nan)
-    fwd_rsi70_days = np.full(n, np.nan)
-    
-    for i in range(n - 15):
-        c0 = c_vals[i]
-        
-        # Exit on Close > 5-Day SMA
-        for k in range(1, 16):
-            if c_vals[i + k] > sma5_vals[i + k]:
-                fwd_sma5_ret[i] = (c_vals[i + k] - c0) / c0 * 100
-                fwd_sma5_days[i] = k
-                break
-        else:
-            fwd_sma5_ret[i] = (c_vals[i + 15] - c0) / c0 * 100
-            fwd_sma5_days[i] = 15
-            
-        # Exit on RSI(2) > 70
-        for k in range(1, 16):
-            if rsi_vals[i + k] > 70:
-                fwd_rsi70_ret[i] = (c_vals[i + k] - c0) / c0 * 100
-                fwd_rsi70_days[i] = k
-                break
-        else:
-            fwd_rsi70_ret[i] = (c_vals[i + 15] - c0) / c0 * 100
-            fwd_rsi70_days[i] = 15
-            
-    df['Fwd_SMA5_Ret'] = fwd_sma5_ret
-    df['Fwd_SMA5_Days'] = fwd_sma5_days
-    df['Fwd_RSI70_Ret'] = fwd_rsi70_ret
-    df['Fwd_RSI70_Days'] = fwd_rsi70_days
-    
-    # 7. Discrete 10-Point Bucketing
+    # 4. Discrete 10-Point Bucketing
     bins = [-0.001, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.001]
     labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
     
@@ -124,42 +84,129 @@ def prepare_stock_data(df):
     
     return df
 
-def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require_uptrend=False):
-    """Aggregates win rate, return distributions, average MAE, and profit factor by bucket."""
-    data = df.dropna(subset=[bucket_col, 'Fwd_5d', 'Fwd_10d', 'Fwd_15d']).copy()
+def simulate_single_ticker_execution(df, bucket_col, atr_pct=0.0, fresh_entry_only=False, require_uptrend=False):
+    """
+    Simulates Next-Day Limit Order Execution: Open - (atr_pct * ATR10).
+    Tracks fill status, dynamic exits, and MAE from entry price.
+    """
+    n = len(df)
+    price_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    c_vals = df[price_col].values
+    o_vals = df['Open'].values
+    l_vals = df['Low'].values
+    sma5_vals = df['SMA_5'].values
+    rsi_vals = df['RSI2'].values
+    atr_vals = df['ATR10'].values
+    b_vals = df[bucket_col].astype(str).values
+    uptrend_vals = df['Above_200SMA'].values
     
-    if require_uptrend:
-        data = data[data['Above_200SMA'] == True]
+    records = []
+    atr_mult = atr_pct / 100.0
+    
+    for i in range(15, n - 16):
+        # Signal Evaluated on Day T
+        b_curr = b_vals[i]
+        if b_curr == 'nan' or b_curr == 'None':
+            continue
+            
+        if require_uptrend and not uptrend_vals[i]:
+            continue
+            
+        if fresh_entry_only and b_vals[i] == b_vals[i - 1]:
+            continue
+            
+        signal_date = df.index[i]
+        atr_t = atr_vals[i]
         
-    if fresh_entry_only:
-        data = data[data[bucket_col] != data[bucket_col].shift(1)]
+        # Day T+1 Execution Check
+        open_next = o_vals[i + 1]
+        low_next = l_vals[i + 1]
+        limit_price = open_next - (atr_mult * atr_t)
         
+        # Check Fill Condition on Day T+1
+        if low_next <= limit_price:
+            filled = True
+            entry_price = min(open_next, limit_price)  # Price improvement on gaps
+        else:
+            filled = False
+            entry_price = np.nan
+            
+        trade_data = {
+            "Signal_Date": signal_date,
+            "Bucket": b_curr,
+            "Year": signal_date.year,
+            "Filled": filled,
+            "Entry_Price": entry_price
+        }
+        
+        if filled:
+            # Fixed 5-Day & 10-Day Exits (evaluated from bar i+1)
+            c_fwd5 = c_vals[i + 1 + 5]
+            c_fwd10 = c_vals[i + 1 + 10]
+            trade_data['Fwd_5d'] = (c_fwd5 - entry_price) / entry_price * 100
+            trade_data['Fwd_10d'] = (c_fwd10 - entry_price) / entry_price * 100
+            
+            # MAE Drawdown Tracking (Worst drop over holding period)
+            min_low_5d = np.min(l_vals[i + 1 : i + 1 + 6])
+            min_low_10d = np.min(l_vals[i + 1 : i + 1 + 11])
+            trade_data['MAE_5d'] = min(0.0, (min_low_5d - entry_price) / entry_price * 100)
+            trade_data['MAE_10d'] = min(0.0, (min_low_10d - entry_price) / entry_price * 100)
+            
+            # Dynamic Snapback: Close > 5-Day SMA
+            for k in range(1, 16):
+                bar_idx = i + 1 + (k - 1)
+                if c_vals[bar_idx] > sma5_vals[bar_idx]:
+                    trade_data['SMA5_Ret'] = (c_vals[bar_idx] - entry_price) / entry_price * 100
+                    trade_data['SMA5_Days'] = k
+                    break
+            else:
+                trade_data['SMA5_Ret'] = (c_vals[i + 1 + 15] - entry_price) / entry_price * 100
+                trade_data['SMA5_Days'] = 15
+                
+            # Dynamic Snapback: RSI(2) > 70
+            for k in range(1, 16):
+                bar_idx = i + 1 + (k - 1)
+                if rsi_vals[bar_idx] >= 70:
+                    trade_data['RSI70_Ret'] = (c_vals[bar_idx] - entry_price) / entry_price * 100
+                    trade_data['RSI70_Days'] = k
+                    break
+            else:
+                trade_data['RSI70_Ret'] = (c_vals[i + 1 + 15] - entry_price) / entry_price * 100
+                trade_data['RSI70_Days'] = 15
+        else:
+            trade_data['Fwd_5d'] = np.nan
+            trade_data['Fwd_10d'] = np.nan
+            trade_data['MAE_5d'] = np.nan
+            trade_data['MAE_10d'] = np.nan
+            trade_data['SMA5_Ret'] = np.nan
+            trade_data['SMA5_Days'] = np.nan
+            trade_data['RSI70_Ret'] = np.nan
+            trade_data['RSI70_Days'] = np.nan
+            
+        records.append(trade_data)
+        
+    return pd.DataFrame(records)
+
+def aggregate_bucket_performance(sim_df):
+    """Compiles statistics by 10-point bucket reflecting limit fills."""
     labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
     records = []
     
     for b in labels:
-        sub = data[data[bucket_col] == b]
-        n = len(sub)
-        if n == 0:
+        sub = sim_df[sim_df['Bucket'] == b]
+        sigs = len(sub)
+        filled_sub = sub[sub['Filled'] == True]
+        n_filled = len(filled_sub)
+        
+        fill_rate = (n_filled / sigs * 100) if sigs > 0 else 0.0
+        
+        if n_filled == 0:
             records.append({
-                "RSI Bucket": b,
-                "Signals": 0,
-                "5D Win Rate (%)": 0.0,
-                "5D Avg Ret (%)": 0.0,
-                "5D Avg Drawdown (%)": 0.0,
-                "5D Profit Factor": 0.0,
-                "10D Win Rate (%)": 0.0,
-                "10D Avg Ret (%)": 0.0,
-                "10D Avg Drawdown (%)": 0.0,
-                "10D Profit Factor": 0.0,
-                "SMA5 Exit Win Rate (%)": 0.0,
-                "SMA5 Exit Avg Ret (%)": 0.0,
-                "SMA5 Avg Hold (Days)": 0.0,
-                "SMA5 Profit Factor": 0.0,
-                "RSI70 Exit Win Rate (%)": 0.0,
-                "RSI70 Exit Avg Ret (%)": 0.0,
-                "RSI70 Avg Hold (Days)": 0.0,
-                "RSI70 Profit Factor": 0.0
+                "RSI Bucket": b, "Signals": sigs, "Filled": 0, "Fill Rate (%)": fill_rate,
+                "5D Win Rate (%)": 0.0, "5D Avg Ret (%)": 0.0, "5D Avg Drawdown (%)": 0.0, "5D Profit Factor": 0.0,
+                "10D Win Rate (%)": 0.0, "10D Avg Ret (%)": 0.0, "10D Avg Drawdown (%)": 0.0, "10D Profit Factor": 0.0,
+                "SMA5 Exit Win Rate (%)": 0.0, "SMA5 Exit Avg Ret (%)": 0.0, "SMA5 Avg Hold (Days)": 0.0, "SMA5 Profit Factor": 0.0,
+                "RSI70 Exit Win Rate (%)": 0.0, "RSI70 Exit Avg Ret (%)": 0.0, "RSI70 Avg Hold (Days)": 0.0, "RSI70 Profit Factor": 0.0
             })
             continue
             
@@ -169,7 +216,7 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require
             avg_mae = mae_series.mean()
             gains = ret_series[ret_series > 0].sum()
             losses = abs(ret_series[ret_series < 0].sum())
-            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
             return round(wr, 1), round(avg_r, 2), round(avg_mae, 2), pf
             
         def stats_dynamic(ret_series, days_series):
@@ -178,17 +225,19 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require
             avg_d = days_series.mean()
             gains = ret_series[ret_series > 0].sum()
             losses = abs(ret_series[ret_series < 0].sum())
-            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
             return round(wr, 1), round(avg_r, 2), round(avg_d, 1), pf
             
-        wr5, avg5, mae5, pf5 = stats_fixed(sub['Fwd_5d'], sub['MAE_5d'])
-        wr10, avg10, mae10, pf10 = stats_fixed(sub['Fwd_10d'], sub['MAE_10d'])
-        wr_sma, avg_sma, days_sma, pf_sma = stats_dynamic(sub['Fwd_SMA5_Ret'], sub['Fwd_SMA5_Days'])
-        wr_rsi, avg_rsi, days_rsi, pf_rsi = stats_dynamic(sub['Fwd_RSI70_Ret'], sub['Fwd_RSI70_Days'])
+        wr5, avg5, mae5, pf5 = stats_fixed(filled_sub['Fwd_5d'], filled_sub['MAE_5d'])
+        wr10, avg10, mae10, pf10 = stats_fixed(filled_sub['Fwd_10d'], filled_sub['MAE_10d'])
+        wr_sma, avg_sma, days_sma, pf_sma = stats_dynamic(filled_sub['SMA5_Ret'], filled_sub['SMA5_Days'])
+        wr_rsi, avg_rsi, days_rsi, pf_rsi = stats_dynamic(filled_sub['RSI70_Ret'], filled_sub['RSI70_Days'])
         
         records.append({
             "RSI Bucket": b,
-            "Signals": int(n),
+            "Signals": int(sigs),
+            "Filled": int(n_filled),
+            "Fill Rate (%)": round(fill_rate, 1),
             "5D Win Rate (%)": wr5,
             "5D Avg Ret (%)": avg5,
             "5D Avg Drawdown (%)": mae5,
@@ -209,41 +258,36 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require
         
     return pd.DataFrame(records).set_index("RSI Bucket")
 
-def aggregate_yearly_performance(df, bucket_col, selected_buckets, exit_col_ret, exit_col_days=None, require_uptrend=False, fresh_entry_only=False):
-    """Calculates yearly breakdown metrics for an asset under chosen bucket and exit criteria."""
-    data = df.dropna(subset=[bucket_col, exit_col_ret]).copy()
-    
-    if require_uptrend:
-        data = data[data['Above_200SMA'] == True]
-        
-    if fresh_entry_only:
-        data = data[data[bucket_col] != data[bucket_col].shift(1)]
-        
-    data = data[data[bucket_col].astype(str).isin(selected_buckets)]
-    
-    if data.empty:
+def aggregate_yearly_performance(sim_df, selected_buckets, exit_col_ret, exit_col_days=None):
+    """Calculates yearly breakdown metrics reflecting limit fills."""
+    sub = sim_df[sim_df['Bucket'].isin(selected_buckets)].copy()
+    if sub.empty:
         return pd.DataFrame()
         
-    data['Year'] = data.index.year
     records = []
-    
-    for yr, group in data.groupby('Year'):
-        n_sigs = len(group)
-        ret_s = group[exit_col_ret]
+    for yr, group in sub.groupby('Year'):
+        sigs = len(group)
+        filled_grp = group[group['Filled'] == True]
+        n_filled = len(filled_grp)
+        fill_rate = (n_filled / sigs * 100) if sigs > 0 else 0.0
         
-        wr = (ret_s > 0).mean() * 100
-        avg_ret = ret_s.mean()
-        
-        gains = ret_s[ret_s > 0].sum()
-        losses = abs(ret_s[ret_s < 0].sum())
-        pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
-        
-        comp_ret = ((1 + ret_s / 100).prod() - 1) * 100
-        avg_days = group[exit_col_days].mean() if exit_col_days and exit_col_days in group else np.nan
-        
+        if n_filled > 0:
+            ret_s = filled_grp[exit_col_ret]
+            wr = (ret_s > 0).mean() * 100
+            avg_ret = ret_s.mean()
+            gains = ret_s[ret_s > 0].sum()
+            losses = abs(ret_s[ret_s < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
+            comp_ret = ((1 + ret_s / 100).prod() - 1) * 100
+            avg_days = filled_grp[exit_col_days].mean() if exit_col_days and exit_col_days in filled_grp else np.nan
+        else:
+            wr, avg_ret, pf, comp_ret, avg_days = 0.0, 0.0, np.nan, 0.0, np.nan
+            
         records.append({
             "Year": str(yr),
-            "Signals": int(n_sigs),
+            "Signals": int(sigs),
+            "Filled": int(n_filled),
+            "Fill Rate (%)": round(fill_rate, 1),
             "Win Rate (%)": round(wr, 1),
             "Avg Return (%)": round(avg_ret, 2),
             "Profit Factor": pf,
@@ -251,18 +295,31 @@ def aggregate_yearly_performance(df, bucket_col, selected_buckets, exit_col_ret,
             "Avg Hold (Days)": round(avg_days, 1) if pd.notna(avg_days) else np.nan
         })
         
-    all_ret = data[exit_col_ret]
-    all_gains = all_ret[all_ret > 0].sum()
-    all_losses = abs(all_ret[all_ret < 0].sum())
-    all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
-    all_comp = ((1 + all_ret / 100).prod() - 1) * 100
-    all_days = data[exit_col_days].mean() if exit_col_days and exit_col_days in data else np.nan
-
+    # All Years Summary
+    tot_sigs = len(sub)
+    tot_filled = sub[sub['Filled'] == True]
+    all_n_filled = len(tot_filled)
+    all_fr = (all_n_filled / tot_sigs * 100) if tot_sigs > 0 else 0.0
+    
+    if all_n_filled > 0:
+        all_ret = tot_filled[exit_col_ret]
+        all_wr = (all_ret > 0).mean() * 100
+        all_avg_ret = all_ret.mean()
+        all_gains = all_ret[all_ret > 0].sum()
+        all_losses = abs(all_ret[all_ret < 0].sum())
+        all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
+        all_comp = ((1 + all_ret / 100).prod() - 1) * 100
+        all_days = tot_filled[exit_col_days].mean() if exit_col_days and exit_col_days in tot_filled else np.nan
+    else:
+        all_wr, all_avg_ret, all_pf, all_comp, all_days = 0.0, 0.0, np.nan, 0.0, np.nan
+        
     records.append({
         "Year": "All Years",
-        "Signals": int(len(data)),
-        "Win Rate (%)": round((all_ret > 0).mean() * 100, 1),
-        "Avg Return (%)": round(all_ret.mean(), 2),
+        "Signals": int(tot_sigs),
+        "Filled": int(all_n_filled),
+        "Fill Rate (%)": round(all_fr, 1),
+        "Win Rate (%)": round(all_wr, 1),
+        "Avg Return (%)": round(all_avg_ret, 2),
         "Profit Factor": all_pf,
         "Annual Compounded Ret (%)": round(all_comp, 2),
         "Avg Hold (Days)": round(all_days, 1) if pd.notna(all_days) else np.nan
@@ -271,25 +328,82 @@ def aggregate_yearly_performance(df, bucket_col, selected_buckets, exit_col_ret,
     return pd.DataFrame(records).set_index("Year")
 
 # ==========================================
-# 2. MULTI-STOCK PORTFOLIO ENGINE
+# 2. MULTI-STOCK & UNIVERSE PORTFOLIO ENGINE
 # ==========================================
 
 def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator_col,
-                           exit_mode="Close > SMA5", max_positions=5, initial_capital=100000.0,
+                           atr_pct=0.0, exit_mode="Close > SMA5", max_positions=5, initial_capital=100000.0,
                            require_uptrend=True, fresh_entry_only=True):
     """
-    Day-by-day multi-stock portfolio simulation.
-    Handles position sizing, cash management, signal ranking, exits, and annual accounting.
+    Day-by-day portfolio simulator supporting Next-Day Limit Orders (Open - X% ATR10).
+    Manages slot allocations, signal prioritization, order fills, dynamic exits, and annual accounting.
     """
     all_dates = sorted(list(set.union(*[set(df.index) for df in prepared_dfs.values()])))
     
     cash = float(initial_capital)
     open_positions = {}
+    pending_orders = []  # [{ticker, limit_price, signal_date, ind_val}]
     trade_log = []
     daily_equity_records = []
     
+    atr_mult = atr_pct / 100.0
+    
     for d in all_dates:
-        # Step A: Process Exits
+        # Step A: Attempt to Fill Pending Limit Orders from Prior Close (d)
+        available_slots = max_positions - len(open_positions)
+        if available_slots > 0 and len(pending_orders) > 0:
+            # Sort by lowest RSI reading (deepest oversold first)
+            pending_orders.sort(key=lambda x: x['ind_val'])
+            
+            # Current Portfolio Value for slot sizing
+            current_mtm = cash
+            for t_open, p_open in open_positions.items():
+                if d in prepared_dfs[t_open].index:
+                    px_now = prepared_dfs[t_open].loc[d]['Adj Close'] if 'Adj Close' in prepared_dfs[t_open].loc[d] else prepared_dfs[t_open].loc[d]['Close']
+                    current_mtm += p_open['shares'] * px_now
+                else:
+                    current_mtm += p_open['shares'] * p_open['entry_price']
+                    
+            target_slot_size = current_mtm / max_positions
+            
+            filled_count = 0
+            for ord_info in pending_orders:
+                if filled_count >= available_slots:
+                    break
+                sym = ord_info['ticker']
+                df_sym = prepared_dfs[sym]
+                
+                if d not in df_sym.index:
+                    continue
+                    
+                row_today = df_sym.loc[d]
+                o_today = row_today['Open']
+                l_today = row_today['Low']
+                
+                # Compute limit price based on today's open
+                limit_px = o_today - (atr_mult * ord_info['atr_prior'])
+                
+                # Check Fill Condition
+                if l_today <= limit_px:
+                    exec_px = min(o_today, limit_px)
+                    invest_amt = min(cash, target_slot_size)
+                    
+                    if invest_amt >= 250.0:
+                        shares = invest_amt / exec_px
+                        cash -= invest_amt
+                        open_positions[sym] = {
+                            'entry_date': d,
+                            'entry_price': exec_px,
+                            'shares': shares,
+                            'cost_basis': invest_amt,
+                            'days_held': 0
+                        }
+                        filled_count += 1
+                        
+            # Day orders expire at the close if unfilled
+            pending_orders = []
+            
+        # Step B: Process Exits on Open Positions (Evaluated at close of day d)
         closed_tickers = []
         for ticker, pos in open_positions.items():
             df = prepared_dfs[ticker]
@@ -339,18 +453,15 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
         for t in closed_tickers:
             del open_positions[t]
             
-        # Step B: Identify Candidate Entries
-        candidates = []
-        available_slots = max_positions - len(open_positions)
-        
+        # Step C: Generate New Pending Limit Orders for Tomorrow's Open (d+1)
         for ticker, df in prepared_dfs.items():
             if ticker in open_positions or d not in df.index:
                 continue
                 
             row = df.loc[d]
-            current_bucket = str(row[bucket_col])
+            curr_b = str(row[bucket_col])
             
-            if current_bucket not in selected_buckets:
+            if curr_b not in selected_buckets:
                 continue
                 
             if require_uptrend and not bool(row['Above_200SMA']):
@@ -359,46 +470,17 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
             if fresh_entry_only:
                 prev_loc = df.index.get_loc(d) - 1
                 if prev_loc >= 0:
-                    prev_bucket = str(df.iloc[prev_loc][bucket_col])
-                    if current_bucket == prev_bucket:
+                    prev_b = str(df.iloc[prev_loc][bucket_col])
+                    if curr_b == prev_b:
                         continue
                         
-            c_price = row['Adj Close'] if 'Adj Close' in row else row['Close']
-            ind_val = row[indicator_col]
-            candidates.append({
+            pending_orders.append({
                 "ticker": ticker,
-                "price": c_price,
-                "ind_val": ind_val
+                "atr_prior": row['ATR10'],
+                "ind_val": row[indicator_col]
             })
             
-        candidates.sort(key=lambda x: x['ind_val'])
-        
-        # Step C: Allocate Capital to Free Slots
-        if available_slots > 0 and len(candidates) > 0:
-            current_mtm = cash
-            for t_open, p_open in open_positions.items():
-                if d in prepared_dfs[t_open].index:
-                    cur_px = prepared_dfs[t_open].loc[d]['Adj Close'] if 'Adj Close' in prepared_dfs[t_open].loc[d] else prepared_dfs[t_open].loc[d]['Close']
-                    current_mtm += p_open['shares'] * cur_px
-                else:
-                    current_mtm += p_open['shares'] * p_open['entry_price']
-                    
-            target_slot_size = current_mtm / max_positions
-            
-            for cand in candidates[:available_slots]:
-                invest_amt = min(cash, target_slot_size)
-                if invest_amt >= 250.0:
-                    shares = invest_amt / cand['price']
-                    cash -= invest_amt
-                    open_positions[cand['ticker']] = {
-                        'entry_date': d,
-                        'entry_price': cand['price'],
-                        'shares': shares,
-                        'cost_basis': invest_amt,
-                        'days_held': 0
-                    }
-                    
-        # Step D: Mark-to-Market Portfolio Equity
+        # Step D: Mark-to-Market Portfolio Equity at Close
         total_equity = cash
         for t_open, p_open in open_positions.items():
             if d in prepared_dfs[t_open].index:
@@ -477,7 +559,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
     return yearly_summary_df, equity_df, trades_df
 
 # ==========================================
-# 3. UNIVERSE FETCHERS & ROBUST CONSTITUENTS
+# 3. UNIVERSE FETCHERS & CONSTITUENTS
 # ==========================================
 
 DJIA_STATIC_FALLBACK = [
@@ -494,15 +576,12 @@ RUSSELL2000_STATIC_FALLBACK = [
     "AMN", "ARWR", "CALX", "CARG", "CEIX", "CNX", "CRUS", "CVCO", "EPRT", "EXPO",
     "FABR", "FLR", "FN", "GTLS", "HAE", "HALO", "ITGR", "KNSL", "LSTR", "MEDP",
     "MRC", "NEOG", "NSIT", "NVST", "OII", "ORA", "OSCR", "POWI", "PRVA", "QTWO",
-    "RBA", "SAIA", "SPSC", "STRL", "TALO", "TKR", "VVI", "WING", "WNS", "ABG",
-    "ABM", "ABCB", "ACAD", "ACHC", "ACIW", "ADUS", "AESI", "AGCO", "AGYS", "AIR"
+    "RBA", "SAIA", "SPSC", "STRL", "TALO", "TKR", "VVI", "WING", "WNS", "ABG"
 ]
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_universe_tickers(universe_name):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"}
     
     def extract_wiki(url):
         try:
@@ -521,8 +600,7 @@ def get_universe_tickers(universe_name):
         if not res:
             try:
                 res = pd.read_csv("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv")['Symbol'].tolist()
-            except Exception:
-                pass
+            except Exception: pass
         return res if res else []
     elif universe_name == "Nasdaq 100":
         res = extract_wiki("https://en.wikipedia.org/wiki/Nasdaq-100")
@@ -582,7 +660,7 @@ def extract_symbol_daily(bulk_data, sym, total_tickers):
 tab_study, tab_watchlist, tab_portfolio, tab_screener = st.tabs([
     "Single Ticker Study & Current Status",
     "Custom Watchlist Analyzer",
-    "📁 Multi-Stock Portfolio Backtester",
+    "📁 Universe & Portfolio Backtester",
     "Live Market Screener"
 ])
 
@@ -590,9 +668,10 @@ tab_study, tab_watchlist, tab_portfolio, tab_screener = st.tabs([
 # TAB 1: SINGLE TICKER STUDY & CURRENT STATUS
 # ----------------------------------------------------
 with tab_study:
-    st.header("Single Ticker Expectancy & Live Status")
+    st.header("Single Ticker Expectancy & Limit Fill Analysis")
     st.write(
-        "Evaluate full historical bucket return distributions while inspecting where the asset currently sits today."
+        "Evaluate full historical bucket distributions with orders placed on the **Next-Day Open** "
+        "at **Open - X% ATR(10)** with fill rate tracking."
     )
     
     col_t1, col_t2, col_t3, col_t4 = st.columns([1.1, 1.2, 1.2, 0.8])
@@ -609,11 +688,20 @@ with tab_study:
     with col_t4:
         years_back = st.number_input("Lookback (Years)", min_value=1, max_value=30, value=20)
         
-    require_uptrend_study = st.checkbox(
-        "Uptrend Filter: Only include setups trading ABOVE 200-Day SMA",
-        value=True,
-        help="Filters out secular bear markets and value traps, isolating high-probability pullback dips."
-    )
+    col_t5, col_t6 = st.columns([1.5, 1.5])
+    with col_t5:
+        atr_limit_discount = st.number_input(
+            "Next-Day Limit Discount (% of 10-Day ATR below Open)",
+            min_value=0.0, max_value=100.0, value=25.0, step=5.0,
+            help="0% = Market on Open. 25% = Limit order at Open - 0.25 * ATR(10). Orders only fill if Low <= Limit Price."
+        )
+    with col_t6:
+        st.write("")
+        require_uptrend_study = st.checkbox(
+            "Uptrend Filter: Only include setups trading ABOVE 200-Day SMA",
+            value=True,
+            help="Filters out secular bear markets and value traps, isolating high-probability pullback dips."
+        )
         
     if st.button("Run Forward Edge & Dynamic Exit Study", type="primary", use_container_width=True):
         start_date = (datetime.now() - timedelta(days=years_back * 365)).strftime('%Y-%m-%d')
@@ -639,7 +727,6 @@ with tab_study:
                 "5-Day Average RSI(2)": "RSI2_5d_avg",
                 "10-Day Average RSI(2)": "RSI2_10d_avg"
             }
-            
             active_bucket_col = bucket_map[study_indicator]
             active_ind_col = indicator_col_map[study_indicator]
             fresh_only = (signal_mode == "Fresh Entry Day Only (No Overlap)")
@@ -649,106 +736,95 @@ with tab_study:
             curr_rsi2 = latest_row['RSI2']
             curr_ind_val = latest_row[active_ind_col]
             curr_bucket = str(latest_row[active_bucket_col])
+            curr_atr = latest_row['ATR10']
             is_above_200 = bool(latest_row['Above_200SMA'])
             
+            # Metric Header
             st.subheader(f"Current Market Status: {study_ticker}")
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Current Price", f"${curr_price:.2f}")
             m2.metric("RSI(2) (Single Bar)", f"{curr_rsi2:.1f}")
             m3.metric(f"Current {study_indicator}", f"{curr_ind_val:.1f}")
-            m4.metric("Active Regime Bucket", curr_bucket)
-            m5.metric("Trend (> 200 SMA)", "Uptrend (Bullish)" if is_above_200 else "Downtrend (Bearish)")
+            m4.metric("Active Bucket", curr_bucket)
+            m5.metric("Current ATR(10)", f"${curr_atr:.2f}")
             
-            perf_table = aggregate_bucket_performance(
-                processed_df, 
-                active_bucket_col, 
+            # Simulate Limit Executions
+            sim_df = simulate_single_ticker_execution(
+                processed_df,
+                bucket_col=active_bucket_col,
+                atr_pct=atr_limit_discount,
                 fresh_entry_only=fresh_only,
                 require_uptrend=require_uptrend_study
             )
             
+            perf_table = aggregate_bucket_performance(sim_df)
+            
+            # Baseline Callout
             if curr_bucket in perf_table.index and perf_table.loc[curr_bucket, "Signals"] > 0:
+                c_sigs = perf_table.loc[curr_bucket, "Signals"]
+                c_filled = perf_table.loc[curr_bucket, "Filled"]
+                c_fr = perf_table.loc[curr_bucket, "Fill Rate (%)"]
                 c_wr = perf_table.loc[curr_bucket, "5D Win Rate (%)"]
                 c_ret = perf_table.loc[curr_bucket, "5D Avg Ret (%)"]
-                c_mae = perf_table.loc[curr_bucket, "5D Avg Drawdown (%)"]
                 c_sma_wr = perf_table.loc[curr_bucket, "SMA5 Exit Win Rate (%)"]
                 c_sma_pf = perf_table.loc[curr_bucket, "SMA5 Profit Factor"]
-                c_sma_days = perf_table.loc[curr_bucket, "SMA5 Avg Hold (Days)"]
                 
                 st.info(
                     f"**Empirical Baseline for Current Regime ({curr_bucket})**: "
-                    f"When **{study_ticker}** trades in the **{curr_bucket}** bucket, its historical **5-day forward win rate is {c_wr}%** "
-                    f"(Avg Return: **{c_ret:+.2f}%**, Avg Drawdown: **{c_mae:.2f}%**). "
-                    f"Exiting dynamically on the first close above the 5-day SMA has yielded a **{c_sma_wr}% win rate** and a **{c_sma_pf} Profit Factor** over an average hold of **{c_sma_days:.1f} days**."
+                    f"Out of **{c_sigs} historical signals**, **{c_filled} orders filled** (**{c_fr}% Fill Rate**) "
+                    f"using a limit at Open - {atr_limit_discount:.1f}% ATR. "
+                    f"Filled trades achieved a **5-day win rate of {c_wr}%** (Avg Return: **{c_ret:+.2f}%**). "
+                    f"Exiting dynamically at Close > 5-Day SMA yielded a **{c_sma_wr}% win rate** and a **{c_sma_pf} Profit Factor**."
                 )
             
             st.subheader(f"Expectancy & Risk Matrix across All Buckets: {study_ticker}")
-            
             study_col_cfg = {
                 "Signals": st.column_config.NumberColumn(format="%d"),
+                "Filled": st.column_config.NumberColumn(format="%d"),
+                "Fill Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
                 "5D Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "5D Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Average worst adverse price drop experienced during the 5 days."),
+                "5D Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%"),
                 "5D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
                 "10D Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "10D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "10D Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%", help="Average worst adverse price drop experienced during the 10 days."),
+                "10D Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%"),
                 "10D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
-                "SMA5 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%", help="Win rate when exiting on the first close above 5-Day SMA."),
+                "SMA5 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "SMA5 Exit Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
                 "SMA5 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
                 "SMA5 Profit Factor": st.column_config.NumberColumn(format="%.2f"),
-                "RSI70 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%", help="Win rate when exiting on the first RSI(2) > 70 thrust."),
+                "RSI70 Exit Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "RSI70 Exit Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
                 "RSI70 Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
                 "RSI70 Profit Factor": st.column_config.NumberColumn(format="%.2f")
             }
-
             st.dataframe(perf_table, column_config=study_col_cfg, use_container_width=True)
             
+            # Analytics Dashboard
             st.subheader("Quantitative Edge Visualizer")
             chart_col1, chart_col2 = st.columns(2)
-            
             with chart_col1:
                 fig_wr = go.Figure()
                 fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Win Rate (%)'], name='Fixed 5-Day', marker_color='#42A5F5'))
-                fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Win Rate (%)'], name='Fixed 10-Day', marker_color='#7E57C2'))
                 fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit Win Rate (%)'], name='Dynamic (Close > SMA5)', marker_color='#26A69A'))
                 fig_wr.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit Win Rate (%)'], name='Dynamic (RSI2 > 70)', marker_color='#FFA726'))
                 fig_wr.add_hline(y=50, line_dash="dash", line_color="white", annotation_text="50% Parity")
-                fig_wr.update_layout(title="Win Rate (%) Across Exit Strategies", barmode='group', template="plotly_dark", yaxis_title="Win Rate (%)", xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20))
+                fig_wr.update_layout(title="Win Rate (%) Across Exit Strategies", barmode='group', template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
                 st.plotly_chart(fig_wr, use_container_width=True)
                 
             with chart_col2:
-                fig_ret = go.Figure()
-                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Avg Ret (%)'], name='Fixed 5-Day', marker_color='#42A5F5'))
-                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['10D Avg Ret (%)'], name='Fixed 10-Day', marker_color='#7E57C2'))
-                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Exit Avg Ret (%)'], name='Dynamic (Close > SMA5)', marker_color='#26A69A'))
-                fig_ret.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Exit Avg Ret (%)'], name='Dynamic (RSI2 > 70)', marker_color='#FFA726'))
-                fig_ret.add_hline(y=0, line_dash="dash", line_color="white")
-                fig_ret.update_layout(title="Average Net Return (%) Across Exit Strategies", barmode='group', template="plotly_dark", yaxis_title="Avg Return (%)", xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20))
-                st.plotly_chart(fig_ret, use_container_width=True)
-                
-            chart_col3, chart_col4 = st.columns(2)
-            with chart_col3:
                 fig_pf = go.Figure()
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['5D Profit Factor'], name='Fixed 5-Day PF', marker_color='#42A5F5'))
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['SMA5 Profit Factor'], name='SMA5 Exit PF', marker_color='#26A69A'))
                 fig_pf.add_trace(go.Bar(x=perf_table.index, y=perf_table['RSI70 Profit Factor'], name='RSI70 Exit PF', marker_color='#FFA726'))
                 fig_pf.add_hline(y=1.0, line_dash="dash", line_color="red", annotation_text="Breakeven (1.0)")
-                fig_pf.add_hline(y=1.5, line_dash="dot", line_color="green", annotation_text="Strong Edge (1.5)")
-                fig_pf.update_layout(title="Profit Factor Across Buckets", barmode='group', template="plotly_dark", yaxis_title="Profit Factor", xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20))
+                fig_pf.update_layout(title="Profit Factor Across Buckets", barmode='group', template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
                 st.plotly_chart(fig_pf, use_container_width=True)
-                
-            with chart_col4:
-                fig_mae = go.Figure()
-                fig_mae.add_trace(go.Scatter(x=perf_table.index, y=perf_table['5D Avg Drawdown (%)'], mode='lines+markers', name='5-Day Avg Drawdown', line=dict(color='#FF5252', width=2.5)))
-                fig_mae.add_trace(go.Scatter(x=perf_table.index, y=perf_table['10D Avg Drawdown (%)'], mode='lines+markers', name='10-Day Avg Drawdown', line=dict(color='#FF7043', width=2, dash='dot')))
-                fig_mae.update_layout(title="Average Adverse Drawdown Pain (MAE %)", template="plotly_dark", yaxis_title="Average Worst Drop (%)", xaxis_title="RSI(2) Bucket", height=400, margin=dict(l=20, r=20, t=40, b=20))
-                st.plotly_chart(fig_mae, use_container_width=True)
 
+            # Year-by-Year Breakdown
             st.divider()
             st.subheader(f"📅 Year-by-Year Performance Breakdown: {study_ticker}")
-            
             col_y1, col_y2 = st.columns([1.5, 2.5])
             with col_y1:
                 year_exit_strat = st.selectbox(
@@ -761,11 +837,11 @@ with tab_study:
                 year_bucket_scope = st.selectbox("Bucket Selection Scope", bucket_scope_options, index=1, key="study_year_scope")
                 
             if year_exit_strat == "Dynamic Snapback: Close > 5-Day SMA":
-                target_ret_col = "Fwd_SMA5_Ret"
-                target_days_col = "Fwd_SMA5_Days"
+                target_ret_col = "SMA5_Ret"
+                target_days_col = "SMA5_Days"
             elif year_exit_strat == "Dynamic Snapback: RSI(2) > 70":
-                target_ret_col = "Fwd_RSI70_Ret"
-                target_days_col = "Fwd_RSI70_Days"
+                target_ret_col = "RSI70_Ret"
+                target_days_col = "RSI70_Days"
             elif year_exit_strat == "Fixed 5-Day Holding Period":
                 target_ret_col = "Fwd_5d"
                 target_days_col = None
@@ -782,14 +858,13 @@ with tab_study:
             else:
                 chosen_buckets = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
                 
-            yearly_table = aggregate_yearly_performance(
-                processed_df, active_bucket_col, chosen_buckets, target_ret_col, target_days_col,
-                require_uptrend=require_uptrend_study, fresh_entry_only=fresh_only
-            )
+            yearly_table = aggregate_yearly_performance(sim_df, chosen_buckets, target_ret_col, target_days_col)
             
             if not yearly_table.empty:
                 year_col_cfg = {
                     "Signals": st.column_config.NumberColumn(format="%d"),
+                    "Filled": st.column_config.NumberColumn(format="%d"),
+                    "Fill Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
                     "Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
                     "Avg Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
                     "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
@@ -809,15 +884,15 @@ with tab_study:
                         hoverinfo='text'
                     ))
                     fig_annual.add_hline(y=0, line_dash="dash", line_color="white")
-                    fig_annual.update_layout(title=f"{study_ticker} Annual Return (%) by Year", template="plotly_dark", yaxis_title="Compounded Return (%)", xaxis_title="Year", height=380, margin=dict(l=20, r=20, t=40, b=20))
+                    fig_annual.update_layout(title=f"{study_ticker} Annual Compounded Strategy Return (%)", template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
                     st.plotly_chart(fig_annual, use_container_width=True)
 
 # ----------------------------------------------------
 # TAB 2: CUSTOM WATCHLIST ANALYZER
 # ----------------------------------------------------
 with tab_watchlist:
-    st.header("Custom Watchlist Analyzer")
-    st.write("Scan personal watchlist tickers for current RSI readings, trailing returns, and historical bucket edge.")
+    st.header("Custom Watchlist Analyzer & Pending Orders")
+    st.write("Scan personal watchlist tickers for current RSI readings, ATR(10) levels, and calculate tomorrow's limit order formula.")
     
     col_w1, col_w2, col_w3 = st.columns([2.5, 1.2, 1])
     with col_w1:
@@ -827,7 +902,13 @@ with tab_watchlist:
     with col_w3:
         watch_hist_years = st.number_input("Historical Depth (Years)", min_value=2, max_value=20, value=5, key="watch_hist_y")
         
-    watch_uptrend_only = st.checkbox("Require Historical Signals to be Above 200 SMA", value=True, key="watch_trend")
+    col_w4, col_w5 = st.columns([1.5, 1.5])
+    with col_w4:
+        watch_atr_discount = st.number_input("Watchlist ATR Discount (%)", min_value=0.0, max_value=100.0, value=25.0, step=5.0, key="watch_atr_disc")
+    with col_w5:
+        st.write("")
+        watch_uptrend_only = st.checkbox("Require Historical Signals to be Above 200 SMA", value=True, key="watch_trend")
+        
     run_watch = st.button("Analyze Custom Watchlist", type="primary", use_container_width=True)
     
     if run_watch:
@@ -855,35 +936,44 @@ with tab_watchlist:
                     
                     curr_p = latest['Adj Close'] if 'Adj Close' in latest else latest['Close']
                     curr_b = str(latest[active_w_bucket_col])
+                    curr_atr = latest['ATR10']
                     is_bull = bool(latest['Above_200SMA'])
                     
-                    sub_history = prep_df[prep_df[active_w_bucket_col] == curr_b].dropna(subset=['Fwd_5d', 'MAE_5d', 'Fwd_SMA5_Ret'])
-                    if watch_uptrend_only:
-                        sub_history = sub_history[sub_history['Above_200SMA'] == True]
-                        
-                    sig_count = len(sub_history)
-                    if sig_count > 0:
-                        h_wr5 = (sub_history['Fwd_5d'] > 0).mean() * 100
-                        h_ret5 = sub_history['Fwd_5d'].mean()
-                        h_wr10 = (sub_history['Fwd_10d'] > 0).mean() * 100
-                        h_mae5 = sub_history['MAE_5d'].mean()
-                        gains = sub_history[sub_history['Fwd_5d'] > 0]['Fwd_5d'].sum()
-                        losses = abs(sub_history[sub_history['Fwd_5d'] < 0]['Fwd_5d'].sum())
-                        h_pf5 = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
-                        h_sma_wr = (sub_history['Fwd_SMA5_Ret'] > 0).mean() * 100
+                    limit_dollar_discount = (watch_atr_discount / 100.0) * curr_atr
+                    
+                    sim_sub = simulate_single_ticker_execution(
+                        prep_df, bucket_col=active_w_bucket_col, atr_pct=watch_atr_discount,
+                        fresh_entry_only=True, require_uptrend=watch_uptrend_only
+                    )
+                    
+                    b_sub = sim_sub[sim_sub['Bucket'] == curr_b]
+                    sigs = len(b_sub)
+                    filled_b = b_sub[b_sub['Filled'] == True]
+                    n_filled = len(filled_b)
+                    
+                    if n_filled > 0:
+                        fr = n_filled / sigs * 100
+                        wr5 = (filled_b['Fwd_5d'] > 0).mean() * 100
+                        ret5 = filled_b['Fwd_5d'].mean()
+                        gains = filled_b[filled_b['Fwd_5d'] > 0]['Fwd_5d'].sum()
+                        losses = abs(filled_b[filled_b['Fwd_5d'] < 0]['Fwd_5d'].sum())
+                        pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
+                        sma_wr = (filled_b['SMA5_Ret'] > 0).mean() * 100
                     else:
-                        h_wr5, h_ret5, h_wr10, h_mae5, h_pf5, h_sma_wr = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+                        fr, wr5, ret5, pf, sma_wr = 0.0, np.nan, np.nan, np.nan, np.nan
                         
                     watchlist_results.append({
                         "Ticker": sym, "Price": round(curr_p, 2), "RSI(2)": round(latest['RSI2'], 1),
-                        "2D Avg": round(latest['RSI2_2d_avg'], 1), "3D Avg": round(latest['RSI2_3d_avg'], 1),
-                        "5D Avg": round(latest['RSI2_5d_avg'], 1), "10D Avg": round(latest['RSI2_10d_avg'], 1),
-                        "Current Bucket": curr_b, "> 200 SMA": "Yes" if is_bull else "No",
-                        "Prior 5D (%)": round(latest['Prior_5d'], 2), "Prior 10D (%)": round(latest['Prior_10d'], 2),
-                        "Hist Signals": sig_count, "Hist 5D Win Rate": round(h_wr5, 1) if pd.notna(h_wr5) else np.nan,
-                        "Hist 5D Avg Ret (%)": round(h_ret5, 2) if pd.notna(h_ret5) else np.nan, "Hist 5D Profit Factor": h_pf5,
-                        "Hist Avg Drawdown (%)": round(h_mae5, 2) if pd.notna(h_mae5) else np.nan,
-                        "Hist SMA5 Exit Win Rate": round(h_sma_wr, 1) if pd.notna(h_sma_wr) else np.nan
+                        "5D Avg": round(latest['RSI2_5d_avg'], 1), "Active Bucket": curr_b,
+                        "ATR(10)": round(curr_atr, 2),
+                        "Tomorrow Limit Offset": f"-${limit_dollar_discount:.2f} off Open",
+                        "> 200 SMA": "Yes" if is_bull else "No",
+                        "Hist Signals": sigs,
+                        "Hist Fill Rate": round(fr, 1) if pd.notna(fr) else 0.0,
+                        "Hist 5D Win Rate": round(wr5, 1) if pd.notna(wr5) else np.nan,
+                        "Hist 5D Avg Ret (%)": round(ret5, 2) if pd.notna(ret5) else np.nan,
+                        "Hist Profit Factor": pf,
+                        "Hist SMA5 Exit Win Rate": round(sma_wr, 1) if pd.notna(sma_wr) else np.nan
                     })
                 except Exception:
                     pass
@@ -894,26 +984,27 @@ with tab_watchlist:
                 w_df = w_df.sort_values(by="5D Avg", ascending=True)
                 w_cfg = {
                     "Ticker": st.column_config.TextColumn(), "Price": st.column_config.NumberColumn(format="$%.2f"),
-                    "RSI(2)": st.column_config.NumberColumn(format="%.1f"), "2D Avg": st.column_config.NumberColumn(format="%.1f"),
-                    "3D Avg": st.column_config.NumberColumn(format="%.1f"), "5D Avg": st.column_config.NumberColumn(format="%.1f"),
-                    "10D Avg": st.column_config.NumberColumn(format="%.1f"), "Current Bucket": st.column_config.TextColumn(),
-                    "> 200 SMA": st.column_config.TextColumn(), "Prior 5D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                    "Prior 10D (%)": st.column_config.NumberColumn(format="%+.2f%%"), "Hist Signals": st.column_config.NumberColumn(format="%d"),
+                    "RSI(2)": st.column_config.NumberColumn(format="%.1f"), "5D Avg": st.column_config.NumberColumn(format="%.1f"),
+                    "Active Bucket": st.column_config.TextColumn(), "ATR(10)": st.column_config.NumberColumn(format="$%.2f"),
+                    "Tomorrow Limit Offset": st.column_config.TextColumn(help="Exact discount subtracted from tomorrow's market open price."),
+                    "> 200 SMA": st.column_config.TextColumn(), "Hist Signals": st.column_config.NumberColumn(format="%d"),
+                    "Hist Fill Rate": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
                     "Hist 5D Win Rate": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-                    "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"), "Hist 5D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
-                    "Hist Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%"), "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)
+                    "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                    "Hist Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                    "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)
                 }
                 st.dataframe(w_df, column_config=w_cfg, use_container_width=True)
                 st.download_button(label="Download Watchlist CSV", data=w_df.to_csv(index=False).encode('utf-8'), file_name="watchlist_analysis.csv", mime='text/csv')
 
 # ----------------------------------------------------
-# TAB 3: UNIVERSE & MULTI-STOCK PORTFOLIO BACKTESTER
+# TAB 3: UNIVERSE & PORTFOLIO BACKTESTER
 # ----------------------------------------------------
 with tab_portfolio:
     st.header("📁 Universe & Multi-Stock Portfolio Backtester")
     st.write(
-        "Simulate an active portfolio backtest across an entire universe or a custom basket. "
-        "Manages cash, allocates position slots, ranks oversold entries, and reports audited year-by-year results."
+        "Simulate an active portfolio backtest across an entire universe or custom basket. "
+        "Orders are submitted for the **Next-Day Open** with a limit discount of **Open - X% ATR(10)**."
     )
     
     col_mode1, col_mode2 = st.columns([1.5, 2.5])
@@ -936,8 +1027,7 @@ with tab_portfolio:
             port_pool_size = st.selectbox(
                 "Universe Candidate Pool Size",
                 ["Top 25 Liquid (Fastest & Stable)", "Top 50 Liquid (Balanced)", "Top 100 Liquid (Deep)", "Full Universe Roster"],
-                index=0,
-                help="Subsampling liquid constituents prevents Yahoo Finance rate-limiting and browser memory timeouts while preserving statistical edge."
+                index=0
             )
     else:
         port_tickers_input = st.text_input(
@@ -964,20 +1054,20 @@ with tab_portfolio:
         
     col_p5, col_p6, col_p7 = st.columns([1.2, 1.2, 1.2])
     with col_p5:
-        port_bucket_scope = st.selectbox(
-            "Target Entry Buckets",
-            ["Oversold Washouts (0-20)", "Severe Capitulation (0-10)", "All Buckets (0-100)"],
-            index=0, key="port_bucket_scope"
-        )
+        port_atr_discount = st.number_input("Next-Day ATR Limit Discount (%)", min_value=0.0, max_value=100.0, value=25.0, step=5.0, key="port_atr_disc")
     with col_p6:
-        port_max_pos = st.number_input("Max Concurrent Position Slots", min_value=1, max_value=20, value=5, key="port_max_pos")
+        port_bucket_scope = st.selectbox("Target Entry Buckets", ["Oversold Washouts (0-20)", "Severe Capitulation (0-10)", "All Buckets (0-100)"], index=0, key="port_bucket_scope")
     with col_p7:
-        port_init_cash = st.number_input("Starting Capital ($)", min_value=5000, value=100000, step=10000, key="port_init_cash")
+        port_max_pos = st.number_input("Max Concurrent Position Slots", min_value=1, max_value=20, value=5, key="port_max_pos")
         
-    col_p8, col_p9 = st.columns(2)
+    col_p8, col_p9, col_p10 = st.columns([1.2, 1.2, 1.2])
     with col_p8:
-        port_require_uptrend = st.checkbox("Require Trend Filter (Close > 200 SMA)", value=True, key="port_trend")
+        port_init_cash = st.number_input("Starting Capital ($)", min_value=5000, value=100000, step=10000, key="port_init_cash")
     with col_p9:
+        st.write("")
+        port_require_uptrend = st.checkbox("Require Trend Filter (Close > 200 SMA)", value=True, key="port_trend")
+    with col_p10:
+        st.write("")
         port_fresh_only = st.checkbox("Fresh Entry Only (Do not re-enter if stock stayed in bucket)", value=True, key="port_fresh")
         
     run_port_backtest = st.button("🚀 Run Portfolio Backtest", type="primary", use_container_width=True)
@@ -1042,6 +1132,7 @@ with tab_portfolio:
                     selected_buckets=selected_p_buckets,
                     bucket_col=active_p_bucket_col,
                     indicator_col=active_p_ind_col,
+                    atr_pct=port_atr_discount,
                     exit_mode=port_exit_mode,
                     max_positions=int(port_max_pos),
                     initial_capital=float(port_init_cash),
@@ -1054,7 +1145,7 @@ with tab_portfolio:
                 
                 c_m1, c_m2, c_m3, c_m4, c_m5, c_m6 = st.columns(6)
                 c_m1.metric("Compounded Return", f"{overall_row['Annual Portfolio Ret (%)']:+,.2f}%")
-                c_m2.metric("Total Trades", f"{int(overall_row['Trades'])}")
+                c_m2.metric("Total Trades Filled", f"{int(overall_row['Trades'])}")
                 c_m3.metric("Win Rate", f"{overall_row['Win Rate (%)']:.1f}%")
                 c_m4.metric("Avg Trade Return", f"{overall_row['Avg Trade Ret (%)']:+.2f}%")
                 c_m5.metric("Profit Factor", f"{overall_row['Profit Factor']}")
@@ -1087,33 +1178,15 @@ with tab_portfolio:
                             hoverinfo='text'
                         ))
                         fig_port_annual.add_hline(y=0, line_dash="dash", line_color="white")
-                        fig_port_annual.update_layout(
-                            title="Annual Portfolio Return (%) by Calendar Year",
-                            template="plotly_dark",
-                            yaxis_title="Return (%)",
-                            xaxis_title="Year",
-                            height=380,
-                            margin=dict(l=20, r=20, t=40, b=20)
-                        )
+                        fig_port_annual.update_layout(title="Annual Portfolio Return (%) by Calendar Year", template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
                         st.plotly_chart(fig_port_annual, use_container_width=True)
                         
                 with col_chart_p2:
                     fig_port_equity = go.Figure()
                     fig_port_equity.add_trace(go.Scatter(
-                        x=port_equity_df.index,
-                        y=port_equity_df['Equity'],
-                        mode='lines',
-                        name='Portfolio Value',
-                        line=dict(color='#00FF66', width=2)
+                        x=port_equity_df.index, y=port_equity_df['Equity'], mode='lines', name='Portfolio Value', line=dict(color='#00FF66', width=2)
                     ))
-                    fig_port_equity.update_layout(
-                        title="Portfolio Equity Compounding ($)",
-                        template="plotly_dark",
-                        yaxis_title="Account Equity ($)",
-                        xaxis_title="Date",
-                        height=380,
-                        margin=dict(l=20, r=20, t=40, b=20)
-                    )
+                    fig_port_equity.update_layout(title="Portfolio Equity Compounding ($)", template="plotly_dark", height=380, margin=dict(l=20, r=20, t=40, b=20))
                     st.plotly_chart(fig_port_equity, use_container_width=True)
                     
                 st.subheader(f"Trade Execution Audit Log ({len(port_trades_df)} Closed Trades)")
@@ -1164,13 +1237,7 @@ with tab_screener:
         status_text = st.empty()
         
         status_text.text("Checking broad market S&P 500 (SPY) breadth...")
-        spy_raw = yf.download(
-            "SPY",
-            period="6mo",
-            interval="1d",
-            auto_adjust=False,
-            progress=False
-        )
+        spy_raw = yf.download("SPY", period="6mo", interval="1d", auto_adjust=False, progress=False)
         spy_prep = prepare_stock_data(spy_raw)
         latest_spy_rsi5 = spy_prep['RSI2_5d_avg'].iloc[-1]
         
@@ -1189,15 +1256,7 @@ with tab_screener:
         progress_bar.progress(30)
         
         status_text.text(f"Downloading daily market data for {len(tickers)} stocks...")
-        bulk_data = yf.download(
-            tickers,
-            period="2y",
-            interval="1d",
-            group_by="ticker",
-            auto_adjust=False,
-            progress=False,
-            threads=True
-        )
+        bulk_data = yf.download(tickers, period="2y", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=True)
         progress_bar.progress(70)
         
         status_text.text("Evaluating indicators, MAE drawdowns, and dynamic snapbacks...")
@@ -1221,29 +1280,18 @@ with tab_screener:
                 if bucket_filter and target_b not in bucket_filter:
                     continue
                     
-                sub_hist = processed[processed[active_filter_bucket] == target_b].dropna(subset=['Fwd_5d', 'MAE_5d', 'Fwd_SMA5_Ret'])
-                if len(sub_hist) > 0:
-                    h_5d_wr = (sub_hist['Fwd_5d'] > 0).mean() * 100
-                    h_5d_avg = sub_hist['Fwd_5d'].mean()
-                    h_mae = sub_hist['MAE_5d'].mean()
-                    gains = sub_hist[sub_hist['Fwd_5d'] > 0]['Fwd_5d'].sum()
-                    losses = abs(sub_hist[sub_hist['Fwd_5d'] < 0]['Fwd_5d'].sum())
-                    h_pf = round(gains / losses, 2) if losses > 0 else (np.nan if gains == 0 else 99.0)
-                    h_sma5_wr = (sub_hist['Fwd_SMA5_Ret'] > 0).mean() * 100
-                else:
-                    h_5d_wr, h_5d_avg, h_mae, h_pf, h_sma5_wr = np.nan, np.nan, np.nan, np.nan, np.nan
-                    
+                c_price = latest['Adj Close'] if 'Adj Close' in latest else latest['Close']
+                atr10 = latest['ATR10']
+                
                 screener_rows.append({
-                    "Ticker": sym, "Current Price": round(latest['Adj Close'] if 'Adj Close' in latest else latest['Close'], 2),
-                    "RSI(2)": round(latest['RSI2'], 1), "2D Avg": round(latest['RSI2_2d_avg'], 1),
-                    "3D Avg": round(latest['RSI2_3d_avg'], 1), "5D Avg": round(latest['RSI2_5d_avg'], 1),
-                    "10D Avg": round(latest['RSI2_10d_avg'], 1), "Active Bucket": target_b,
-                    "Above 200 SMA": "Yes" if is_above_200 else "No", "Market Context": "Systemic" if latest_spy_rsi5 <= 25 else "Idiosyncratic",
-                    "Prior 5D Ret (%)": round(latest['Prior_5d'], 2), "Prior 10D Ret (%)": round(latest['Prior_10d'], 2),
-                    "Hist 5D Win Rate": round(h_5d_wr, 1) if pd.notna(h_5d_wr) else np.nan,
-                    "Hist 5D Avg Ret (%)": round(h_5d_avg, 2) if pd.notna(h_5d_avg) else np.nan,
-                    "Hist 5D Profit Factor": h_pf, "Hist Avg Drawdown (%)": round(h_mae, 2) if pd.notna(h_mae) else np.nan,
-                    "Hist SMA5 Exit Win Rate": round(h_sma5_wr, 1) if pd.notna(h_sma5_wr) else np.nan
+                    "Ticker": sym, "Current Price": round(c_price, 2), "RSI(2)": round(latest['RSI2'], 1),
+                    "2D Avg": round(latest['RSI2_2d_avg'], 1), "3D Avg": round(latest['RSI2_3d_avg'], 1),
+                    "5D Avg": round(latest['RSI2_5d_avg'], 1), "10D Avg": round(latest['RSI2_10d_avg'], 1),
+                    "Active Bucket": target_b, "ATR(10)": round(atr10, 2),
+                    "Tomorrow Limit Target (25% ATR)": f"Open - ${0.25 * atr10:.2f}",
+                    "Above 200 SMA": "Yes" if is_above_200 else "No",
+                    "Market Context": "Systemic" if latest_spy_rsi5 <= 25 else "Idiosyncratic",
+                    "Prior 5D Ret (%)": round(latest['Prior_5d'], 2), "Prior 10D Ret (%)": round(latest['Prior_10d'], 2)
                 })
             except Exception:
                 pass
@@ -1265,11 +1313,10 @@ with tab_screener:
                 "RSI(2)": st.column_config.NumberColumn(format="%.1f"), "2D Avg": st.column_config.NumberColumn(format="%.1f"),
                 "3D Avg": st.column_config.NumberColumn(format="%.1f"), "5D Avg": st.column_config.NumberColumn(format="%.1f"),
                 "10D Avg": st.column_config.NumberColumn(format="%.1f"), "Active Bucket": st.column_config.TextColumn(),
+                "ATR(10)": st.column_config.NumberColumn(format="$%.2f"),
+                "Tomorrow Limit Target (25% ATR)": st.column_config.TextColumn(help="Suggested limit entry offset from tomorrow's market open."),
                 "Above 200 SMA": st.column_config.TextColumn(), "Market Context": st.column_config.TextColumn(),
-                "Prior 5D Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"), "Prior 10D Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "Hist 5D Win Rate": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-                "Hist 5D Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"), "Hist 5D Profit Factor": st.column_config.NumberColumn(format="%.2f"),
-                "Hist Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%"), "Hist SMA5 Exit Win Rate": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100)
+                "Prior 5D Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"), "Prior 10D Ret (%)": st.column_config.NumberColumn(format="%+.2f%%")
             }
             st.dataframe(screen_df, column_config=screener_col_cfg, use_container_width=True)
             st.download_button(label="Download Screener CSV", data=screen_df.to_csv(index=False).encode('utf-8'), file_name="rsi2_screener.csv", mime='text/csv')
