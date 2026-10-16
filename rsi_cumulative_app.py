@@ -174,6 +174,191 @@ def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require
         wr_rsi, avg_rsi, days_rsi, pf_rsi = stats_dynamic(sub['Fwd_RSI70_Ret'], sub['Fwd_RSI70_Days'])
         
         records.append({
+            "This `SyntaxError: '(' was never closed` occurred because the line calling `yf.download` inside `fetch_daily_data` was truncated at `end` during copy-paste[cite: 8]. 
+
+The complete, wrap-safe script below formats all multi-argument function calls across dedicated lines so that text-buffer truncations cannot break the syntax.
+
+### Complete Corrected Code (`rsi_cumulative_app.py`)
+
+Replace the entire contents of **`rsi_cumulative_app.py`** in your GitHub repository with this code:
+
+```python
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import requests
+import re
+
+st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
+
+st.title("Cumulative RSI(2) Quantitative Edge Platform")
+st.caption(
+    "Parametric Multi-Day Smoothed RSI(2) Engine | Multi-Stock Portfolio Backtester (Up to 10 Tickers) | "
+    "Year-by-Year Performance Breakdown | Dynamic Snapback Exits (SMA5, RSI70) | MAE Drawdown Tracking."
+)
+
+# ==========================================
+# 1. CORE QUANTITATIVE FUNCTIONS
+# ==========================================
+
+def calculate_wilders_rsi(prices, period=2):
+    """Calculates standard Wilder's Smoothed RSI(2)."""
+    delta = prices.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(100)
+
+def prepare_stock_data(df):
+    """Computes indicators, preceding momentum, fixed/dynamic exits, and MAE drawdowns."""
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
+        
+    price_col = 'Adj Close' if 'Adj Close' in df.columns else 'Close'
+    close_s = df[price_col]
+    low_s = df['Low']
+    
+    # 1. Core Indicators & Lookback Horizons
+    df['RSI2'] = calculate_wilders_rsi(close_s, period=2)
+    df['RSI2_2d_avg'] = df['RSI2'].rolling(window=2).mean()
+    df['RSI2_3d_avg'] = df['RSI2'].rolling(window=3).mean()
+    df['RSI2_5d_avg'] = df['RSI2'].rolling(window=5).mean()
+    df['RSI2_10d_avg'] = df['RSI2'].rolling(window=10).mean()
+    
+    # 2. Trend Overlays
+    df['SMA_5'] = close_s.rolling(window=5).mean()
+    df['SMA_200'] = close_s.rolling(window=200).mean()
+    df['Above_200SMA'] = close_s > df['SMA_200']
+    
+    # 3. Preceding Returns (Trailing Momentum)
+    df['Prior_5d'] = (close_s - close_s.shift(5)) / close_s.shift(5) * 100
+    df['Prior_10d'] = (close_s - close_s.shift(10)) / close_s.shift(10) * 100
+    df['Prior_15d'] = (close_s - close_s.shift(15)) / close_s.shift(15) * 100
+    
+    # 4. Fixed Forward Returns
+    df['Fwd_5d'] = (close_s.shift(-5) - close_s) / close_s * 100
+    df['Fwd_10d'] = (close_s.shift(-10) - close_s) / close_s * 100
+    df['Fwd_15d'] = (close_s.shift(-15) - close_s) / close_s * 100
+    
+    # 5. True Maximum Adverse Excursion (MAE)
+    min_low_5d = low_s.iloc[::-1].rolling(5).min().shift(1).iloc[::-1]
+    min_low_10d = low_s.iloc[::-1].rolling(10).min().shift(1).iloc[::-1]
+    
+    raw_mae_5d = (min_low_5d - close_s) / close_s * 100
+    raw_mae_10d = (min_low_10d - close_s) / close_s * 100
+    
+    df['MAE_5d'] = raw_mae_5d.clip(upper=0.0)
+    df['MAE_10d'] = raw_mae_10d.clip(upper=0.0)
+    
+    # 6. Dynamic Snapback Exits
+    n = len(df)
+    c_vals = close_s.values
+    sma5_vals = df['SMA_5'].values
+    rsi_vals = df['RSI2'].values
+    
+    fwd_sma5_ret = np.full(n, np.nan)
+    fwd_sma5_days = np.full(n, np.nan)
+    fwd_rsi70_ret = np.full(n, np.nan)
+    fwd_rsi70_days = np.full(n, np.nan)
+    
+    for i in range(n - 15):
+        c0 = c_vals[i]
+        
+        # Exit on Close > 5-Day SMA
+        for k in range(1, 16):
+            if c_vals[i + k] > sma5_vals[i + k]:
+                fwd_sma5_ret[i] = (c_vals[i + k] - c0) / c0 * 100
+                fwd_sma5_days[i] = k
+                break
+        else:
+            fwd_sma5_ret[i] = (c_vals[i + 15] - c0) / c0 * 100
+            fwd_sma5_days[i] = 15
+            
+        # Exit on RSI(2) > 70
+        for k in range(1, 16):
+            if rsi_vals[i + k] > 70:
+                fwd_rsi70_ret[i] = (c_vals[i + k] - c0) / c0 * 100
+                fwd_rsi70_days[i] = k
+                break
+        else:
+            fwd_rsi70_ret[i] = (c_vals[i + 15] - c0) / c0 * 100
+            fwd_rsi70_days[i] = 15
+            
+    df['Fwd_SMA5_Ret'] = fwd_sma5_ret
+    df['Fwd_SMA5_Days'] = fwd_sma5_days
+    df['Fwd_RSI70_Ret'] = fwd_rsi70_ret
+    df['Fwd_RSI70_Days'] = fwd_rsi70_days
+    
+    # 7. Discrete 10-Point Bucketing
+    bins = [-0.001, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.001]
+    labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
+    
+    df['Bucket_2d'] = pd.cut(df['RSI2_2d_avg'], bins=bins, labels=labels)
+    df['Bucket_3d'] = pd.cut(df['RSI2_3d_avg'], bins=bins, labels=labels)
+    df['Bucket_5d'] = pd.cut(df['RSI2_5d_avg'], bins=bins, labels=labels)
+    df['Bucket_10d'] = pd.cut(df['RSI2_10d_avg'], bins=bins, labels=labels)
+    
+    return df
+
+def aggregate_bucket_performance(df, bucket_col, fresh_entry_only=False, require_uptrend=False):
+    """Aggregates win rate, return distributions, average MAE, and profit factor by bucket."""
+    data = df.dropna(subset=[bucket_col, 'Fwd_5d', 'Fwd_10d', 'Fwd_15d']).copy()
+    
+    if require_uptrend:
+        data = data[data['Above_200SMA'] == True]
+        
+    if fresh_entry_only:
+        data = data[data[bucket_col] != data[bucket_col].shift(1)]
+        
+    labels = ['0-10', '11-20', '21-30', '31-40', '41-50', '51-60', '61-70', '71-80', '81-90', '91-100']
+    records = []
+    
+    for b in labels:
+        sub = data[data[bucket_col] == b]
+        n = len(sub)
+        if n == 0:
+            records.append({
+                "RSI Bucket": b, "Signals": 0,
+                "5D Win Rate (%)": 0.0, "5D Avg Ret (%)": 0.0, "5D Avg Drawdown (%)": 0.0, "5D Profit Factor": 0.0,
+                "10D Win Rate (%)": 0.0, "10D Avg Ret (%)": 0.0, "10D Avg Drawdown (%)": 0.0, "10D Profit Factor": 0.0,
+                "SMA5 Exit Win Rate (%)": 0.0, "SMA5 Exit Avg Ret (%)": 0.0, "SMA5 Avg Hold (Days)": 0.0, "SMA5 Profit Factor": 0.0,
+                "RSI70 Exit Win Rate (%)": 0.0, "RSI70 Exit Avg Ret (%)": 0.0, "RSI70 Avg Hold (Days)": 0.0, "RSI70 Profit Factor": 0.0
+            })
+            continue
+            
+        def stats_fixed(ret_series, mae_series):
+            wr = (ret_series > 0).mean() * 100
+            avg_r = ret_series.mean()
+            avg_mae = mae_series.mean()
+            gains = ret_series[ret_series > 0].sum()
+            losses = abs(ret_series[ret_series < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            return round(wr, 1), round(avg_r, 2), round(avg_mae, 2), pf
+            
+        def stats_dynamic(ret_series, days_series):
+            wr = (ret_series > 0).mean() * 100
+            avg_r = ret_series.mean()
+            avg_d = days_series.mean()
+            gains = ret_series[ret_series > 0].sum()
+            losses = abs(ret_series[ret_series < 0].sum())
+            pf = round(gains / losses, 2) if losses > 0 else np.nan
+            return round(wr, 1), round(avg_r, 2), round(avg_d, 1), pf
+            
+        wr5, avg5, mae5, pf5 = stats_fixed(sub['Fwd_5d'], sub['MAE_5d'])
+        wr10, avg10, mae10, pf10 = stats_fixed(sub['Fwd_10d'], sub['MAE_10d'])
+        wr_sma, avg_sma, days_sma, pf_sma = stats_dynamic(sub['Fwd_SMA5_Ret'], sub['Fwd_SMA5_Days'])
+        wr_rsi, avg_rsi, days_rsi, pf_rsi = stats_dynamic(sub['Fwd_RSI70_Ret'], sub['Fwd_RSI70_Days'])
+        
+        records.append({
             "RSI Bucket": b,
             "Signals": int(n),
             "5D Win Rate (%)": wr5,
@@ -268,16 +453,15 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
     Day-by-day multi-stock portfolio simulation.
     Handles position sizing, cash management, signal ranking, exits, and annual accounting.
     """
-    # 1. Align common date timeline
     all_dates = sorted(list(set.union(*[set(df.index) for df in prepared_dfs.values()])))
     
     cash = float(initial_capital)
-    open_positions = {}  # {ticker: {'entry_date': d, 'entry_price': p, 'shares': s, 'cost_basis': c, 'days_held': 0}}
+    open_positions = {}
     trade_log = []
     daily_equity_records = []
     
     for d in all_dates:
-        # Step A: Process Exits on Open Positions
+        # Step A: Process Exits
         closed_tickers = []
         for ticker, pos in open_positions.items():
             df = prepared_dfs[ticker]
@@ -327,7 +511,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
         for t in closed_tickers:
             del open_positions[t]
             
-        # Step B: Identify Candidate Entries Across Available Tickers
+        # Step B: Identify Candidate Entries
         candidates = []
         available_slots = max_positions - len(open_positions)
         
@@ -359,12 +543,10 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
                 "ind_val": ind_val
             })
             
-        # Rank by lowest indicator value (deepest oversold first)
         candidates.sort(key=lambda x: x['ind_val'])
         
-        # Step C: Allocate Capital to Slots
+        # Step C: Allocate Capital to Free Slots
         if available_slots > 0 and len(candidates) > 0:
-            # Current portfolio value at market close
             current_mtm = cash
             for t_open, p_open in open_positions.items():
                 if d in prepared_dfs[t_open].index:
@@ -377,7 +559,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
             
             for cand in candidates[:available_slots]:
                 invest_amt = min(cash, target_slot_size)
-                if invest_amt >= 250.0:  # Minimum viable allocation
+                if invest_amt >= 250.0:
                     shares = invest_amt / cand['price']
                     cash -= invest_amt
                     open_positions[cand['ticker']] = {
@@ -388,7 +570,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
                         'days_held': 0
                     }
                     
-        # Step D: Mark-to-Market Total Portfolio Value
+        # Step D: Mark-to-Market Portfolio Equity
         total_equity = cash
         for t_open, p_open in open_positions.items():
             if d in prepared_dfs[t_open].index:
@@ -402,7 +584,7 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
     equity_df = pd.DataFrame(daily_equity_records).set_index("Date")
     trades_df = pd.DataFrame(trade_log)
     
-    # Step E: Aggregate Year-by-Year Portfolio Metrics
+    # Step E: Aggregate Year-by-Year Results
     equity_df['Year'] = equity_df.index.year
     yearly_records = []
     
@@ -411,11 +593,9 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
         end_eq = grp['Equity'].iloc[-1]
         yr_return = ((end_eq / start_eq) - 1) * 100
         
-        # Max Drawdown within year
         cummax = grp['Equity'].cummax()
         yr_dd = ((grp['Equity'] - cummax) / cummax).min() * 100
         
-        # Trade log statistics for this year
         yr_trades = trades_df[trades_df['Year'] == yr] if not trades_df.empty else pd.DataFrame()
         n_trades = len(yr_trades)
         
@@ -437,81 +617,3 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
             "Profit Factor": pf,
             "Annual Portfolio Ret (%)": round(yr_return, 2),
             "Max Drawdown (%)": round(yr_dd, 1),
-            "Avg Hold (Days)": round(avg_days, 1)
-        })
-        
-    # Overall Summary Row
-    tot_ret = ((equity_df['Equity'].iloc[-1] / initial_capital) - 1) * 100
-    overall_cummax = equity_df['Equity'].cummax()
-    overall_dd = ((equity_df['Equity'] - overall_cummax) / overall_cummax).min() * 100
-    
-    if not trades_df.empty:
-        all_wr = (trades_df['Result'] == 'Win').mean() * 100
-        all_avg_ret = trades_df['Return (%)'].mean()
-        all_gains = trades_df[trades_df['Return (%)'] > 0]['Return (%)'].sum()
-        all_losses = abs(trades_df[trades_df['Return (%)'] < 0]['Return (%)'].sum())
-        all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
-        all_hold = trades_df['Days Held'].mean()
-    else:
-        all_wr, all_avg_ret, all_pf, all_hold = 0.0, 0.0, np.nan, 0.0
-        
-    yearly_records.append({
-        "Year": "All Years",
-        "Trades": int(len(trades_df)),
-        "Win Rate (%)": round(all_wr, 1),
-        "Avg Trade Ret (%)": round(all_avg_ret, 2),
-        "Profit Factor": all_pf,
-        "Annual Portfolio Ret (%)": round(tot_ret, 2),
-        "Max Drawdown (%)": round(overall_dd, 1),
-        "Avg Hold (Days)": round(all_hold, 1)
-    })
-    
-    yearly_summary_df = pd.DataFrame(yearly_records).set_index("Year")
-    return yearly_summary_df, equity_df, trades_df
-
-# ==========================================
-# 3. UNIVERSE FETCHERS & PARSERS
-# ==========================================
-
-DJIA_STATIC_FALLBACK = [
-    "AAPL", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS", "GS",
-    "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
-    "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT"
-]
-
-@st.cache_data(show_spinner=False, ttl=86400)
-def get_universe_tickers(universe_name):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36"}
-    
-    def extract_wiki(url):
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                for df in pd.read_html(resp.text):
-                    for col in ['Symbol', 'Ticker']:
-                        if col in df.columns:
-                            return [s.replace('.', '-') for s in df[col].dropna().astype(str).tolist()]
-        except Exception:
-            pass
-        return []
-
-    if universe_name == "S&P 500":
-        res = extract_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        if not res:
-            try:
-                res = pd.read_csv("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv")['Symbol'].tolist()
-            except Exception: pass
-        return res
-    elif universe_name == "Nasdaq 100":
-        res = extract_wiki("https://en.wikipedia.org/wiki/Nasdaq-100")
-        return res if res else ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "COST", "AMD"]
-    elif universe_name == "Dow Jones 30":
-        res = extract_wiki("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
-        return res if res else DJIA_STATIC_FALLBACK
-    elif universe_name == "Major ETFs":
-        return ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "SMH", "TLT", "GLD"]
-    return []
-
-@st.cache_data(show_spinner=False)
-def fetch_daily_data(symbol, start, end):
-    df = yf.download(symbol, start=start, end
