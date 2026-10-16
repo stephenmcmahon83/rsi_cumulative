@@ -11,8 +11,8 @@ st.set_page_config(page_title="Cumulative RSI(2) Edge Platform", layout="wide")
 
 st.title("Cumulative RSI(2) Quantitative Edge Platform")
 st.caption(
-    "Parametric Multi-Day Smoothed RSI(2) Engine | Multi-Stock Portfolio Backtester (Up to 10 Tickers) | "
-    "Year-by-Year Performance Breakdown | Dynamic Snapback Exits (SMA5, RSI70) | MAE Drawdown Tracking."
+    "Parametric Multi-Day Smoothed RSI(2) Engine | Universe & Multi-Stock Portfolio Backtester | "
+    "Russell 2000 & S&P 500 Coverage | Year-by-Year Auditing | Dynamic Snapback Exits."
 )
 
 # ==========================================
@@ -477,13 +477,25 @@ def run_portfolio_backtest(prepared_dfs, selected_buckets, bucket_col, indicator
     return yearly_summary_df, equity_df, trades_df
 
 # ==========================================
-# 3. UNIVERSE FETCHERS & PARSERS
+# 3. UNIVERSE FETCHERS & ROBUST CONSTITUENTS
 # ==========================================
 
 DJIA_STATIC_FALLBACK = [
     "AAPL", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS", "GS",
     "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
     "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT"
+]
+
+RUSSELL2000_STATIC_FALLBACK = [
+    "BTSG", "MOG-A", "FROG", "TWST", "GKOS", "UMBF", "SM", "PCVX", "FCFS", "EAT",
+    "PBF", "CTRE", "ONB", "KRYS", "TXG", "JXN", "LTH", "KYMR", "PTGX", "KNTK",
+    "CYTK", "TGTX", "IDCC", "VSAT", "ZETA", "HNGE", "RHP", "ZWS", "HQY", "PACS",
+    "URBN", "SLAB", "TTAN", "CMC", "ACA", "VSXY", "ALKT", "ACLS", "ADMA", "AEO",
+    "AMN", "ARWR", "CALX", "CARG", "CEIX", "CNX", "CRUS", "CVCO", "EPRT", "EXPO",
+    "FABR", "FLR", "FN", "GTLS", "HAE", "HALO", "ITGR", "KNSL", "LSTR", "MEDP",
+    "MRC", "NEOG", "NSIT", "NVST", "OII", "ORA", "OSCR", "POWI", "PRVA", "QTWO",
+    "RBA", "SAIA", "SPSC", "STRL", "TALO", "TKR", "VVI", "WING", "WNS", "ABG",
+    "ABM", "ABCB", "ACAD", "ACHC", "ACIW", "ADUS", "AESI", "AGCO", "AGYS", "AIR"
 ]
 
 @st.cache_data(show_spinner=False, ttl=86400)
@@ -511,13 +523,20 @@ def get_universe_tickers(universe_name):
                 res = pd.read_csv("https://raw.githubusercontent.com/datasets/s-and-p-500-companies/master/data/constituents.csv")['Symbol'].tolist()
             except Exception:
                 pass
-        return res
+        return res if res else []
     elif universe_name == "Nasdaq 100":
         res = extract_wiki("https://en.wikipedia.org/wiki/Nasdaq-100")
         return res if res else ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "COST", "AMD"]
     elif universe_name == "Dow Jones 30":
         res = extract_wiki("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
         return res if res else DJIA_STATIC_FALLBACK
+    elif "Russell 2000" in universe_name:
+        res = extract_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")
+        if not res:
+            res = RUSSELL2000_STATIC_FALLBACK
+        else:
+            res = list(dict.fromkeys(res + RUSSELL2000_STATIC_FALLBACK))
+        return res
     elif universe_name == "Major ETFs":
         return ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "SMH", "TLT", "GLD"]
     return []
@@ -888,22 +907,46 @@ with tab_watchlist:
                 st.download_button(label="Download Watchlist CSV", data=w_df.to_csv(index=False).encode('utf-8'), file_name="watchlist_analysis.csv", mime='text/csv')
 
 # ----------------------------------------------------
-# TAB 3: MULTI-STOCK PORTFOLIO BACKTESTER
+# TAB 3: UNIVERSE & MULTI-STOCK PORTFOLIO BACKTESTER
 # ----------------------------------------------------
 with tab_portfolio:
-    st.header("📁 Multi-Stock Portfolio Backtester (Up to 10 Stocks)")
+    st.header("📁 Universe & Multi-Stock Portfolio Backtester")
     st.write(
-        "Simulate an active portfolio across up to 10 stocks simultaneously. Manages cash, limits concurrent positions, "
-        "ranks oversold entries, executes dynamic exits, and reports audited year-by-year performance."
+        "Simulate an active portfolio backtest across an entire universe or a custom basket. "
+        "Manages cash, allocates position slots, ranks oversold entries, and reports audited year-by-year results."
     )
     
-    col_p1, col_p2, col_p3 = st.columns([2.5, 1.2, 1.0])
-    with col_p1:
+    col_mode1, col_mode2 = st.columns([1.5, 2.5])
+    with col_mode1:
+        portfolio_mode = st.radio(
+            "Portfolio Source",
+            ["Universe Benchmark (Entire Roster)", "Custom Ticker Basket (Manual)"],
+            index=0, key="port_source_mode"
+        )
+        
+    if portfolio_mode == "Universe Benchmark (Entire Roster)":
+        col_u1, col_u2 = st.columns([1.5, 1.5])
+        with col_u1:
+            port_universe_choice = st.selectbox(
+                "Benchmark Universe",
+                ["Russell 2000 (Small Caps)", "S&P 500", "Nasdaq 100", "Dow Jones 30", "Major ETFs"],
+                index=0, key="port_univ_sel"
+            )
+        with col_u2:
+            port_pool_size = st.selectbox(
+                "Universe Candidate Pool Size",
+                ["Top 25 Liquid (Fastest & Stable)", "Top 50 Liquid (Balanced)", "Top 100 Liquid (Deep)", "Full Universe Roster"],
+                index=0,
+                help="Subsampling liquid constituents prevents Yahoo Finance rate-limiting and browser memory timeouts while preserving statistical edge."
+            )
+    else:
         port_tickers_input = st.text_input(
-            "Portfolio Tickers (Up to 10, comma or space separated)",
+            "Portfolio Tickers (comma or space separated)",
             value="SPY, QQQ, AAPL, MSFT, NVDA, AMZN, TSLA, GOOGL, META, IWM",
             key="port_tickers_input"
         )
+        
+    col_p2, col_p3, col_p4 = st.columns([1.2, 1.2, 1.2])
     with col_p2:
         port_indicator_choice = st.selectbox(
             "Regime Indicator",
@@ -911,15 +954,15 @@ with tab_portfolio:
             index=0, key="port_ind_choice"
         )
     with col_p3:
-        port_years = st.number_input("Lookback Scope (Years)", min_value=2, max_value=25, value=15, key="port_years")
-        
-    col_p4, col_p5, col_p6, col_p7 = st.columns([1.2, 1.2, 1.0, 1.0])
+        port_years = st.number_input("Lookback Scope (Years)", min_value=2, max_value=25, value=10, key="port_years")
     with col_p4:
         port_exit_mode = st.selectbox(
             "Exit Strategy",
             ["Close > SMA5", "RSI(2) > 70", "Fixed 5-Day Hold", "Fixed 10-Day Hold"],
             index=0, key="port_exit_mode"
         )
+        
+    col_p5, col_p6, col_p7 = st.columns([1.2, 1.2, 1.2])
     with col_p5:
         port_bucket_scope = st.selectbox(
             "Target Entry Buckets",
@@ -927,7 +970,7 @@ with tab_portfolio:
             index=0, key="port_bucket_scope"
         )
     with col_p6:
-        port_max_pos = st.number_input("Max Concurrent Positions", min_value=1, max_value=10, value=5, key="port_max_pos")
+        port_max_pos = st.number_input("Max Concurrent Position Slots", min_value=1, max_value=20, value=5, key="port_max_pos")
     with col_p7:
         port_init_cash = st.number_input("Starting Capital ($)", min_value=5000, value=100000, step=10000, key="port_init_cash")
         
@@ -937,19 +980,26 @@ with tab_portfolio:
     with col_p9:
         port_fresh_only = st.checkbox("Fresh Entry Only (Do not re-enter if stock stayed in bucket)", value=True, key="port_fresh")
         
-    run_port_backtest = st.button("Run Portfolio Backtest", type="primary", use_container_width=True)
+    run_port_backtest = st.button("🚀 Run Portfolio Backtest", type="primary", use_container_width=True)
     
     if run_port_backtest:
-        raw_tickers = [s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_tickers_input) if s.strip()]
-        
-        if len(raw_tickers) > 10:
-            st.info(f"Limiting universe to the first 10 symbols: {', '.join(raw_tickers[:10])}")
-            port_tickers = raw_tickers[:10]
+        if portfolio_mode == "Universe Benchmark (Entire Roster)":
+            with st.spinner(f"Loading roster for {port_universe_choice}..."):
+                full_roster = get_universe_tickers(port_universe_choice)
+                
+            if "Top 25" in port_pool_size:
+                port_tickers = full_roster[:25]
+            elif "Top 50" in port_pool_size:
+                port_tickers = full_roster[:50]
+            elif "Top 100" in port_pool_size:
+                port_tickers = full_roster[:100]
+            else:
+                port_tickers = full_roster
         else:
-            port_tickers = raw_tickers
+            port_tickers = [s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_tickers_input) if s.strip()]
             
         if not port_tickers:
-            st.warning("Please provide at least one ticker symbol.")
+            st.warning("Please provide at least one ticker symbol or select a valid universe.")
         else:
             with st.spinner(f"Downloading historical daily data for {len(port_tickers)} tickers over {port_years} years..."):
                 start_p = (datetime.now() - timedelta(days=port_years * 365)).strftime('%Y-%m-%d')
@@ -993,7 +1043,7 @@ with tab_portfolio:
                     bucket_col=active_p_bucket_col,
                     indicator_col=active_p_ind_col,
                     exit_mode=port_exit_mode,
-                    max_positions=port_max_pos,
+                    max_positions=int(port_max_pos),
                     initial_capital=float(port_init_cash),
                     require_uptrend=port_require_uptrend,
                     fresh_entry_only=port_fresh_only
@@ -1093,7 +1143,11 @@ with tab_screener:
     
     col_s1, col_s2, col_s3, col_s4 = st.columns([1.1, 1.2, 1.3, 0.8])
     with col_s1:
-        universe_choice = st.selectbox("Screener Universe", ["S&P 500", "Nasdaq 100", "Dow Jones 30", "Major ETFs"], key="screen_univ")
+        universe_choice = st.selectbox(
+            "Screener Universe",
+            ["Russell 2000 (Small Caps)", "S&P 500", "Nasdaq 100", "Dow Jones 30", "Major ETFs"],
+            index=0, key="screen_univ"
+        )
     with col_s2:
         screener_lookback = st.selectbox("Filter By Indicator", ["5D Avg RSI(2)", "3D Avg RSI(2)", "2D Avg RSI(2)", "10D Avg RSI(2)"], index=0, key="screen_ind")
     with col_s3:
@@ -1154,15 +1208,18 @@ with tab_screener:
         for sym in tickers:
             try:
                 df_sym = extract_symbol_daily(bulk_data, sym, len(tickers))
-                if len(df_sym) < 220: continue
+                if len(df_sym) < 220:
+                    continue
                 processed = prepare_stock_data(df_sym)
                 latest = processed.iloc[-1]
                 
                 is_above_200 = bool(latest['Above_200SMA'])
-                if require_uptrend_screener and not is_above_200: continue
+                if require_uptrend_screener and not is_above_200:
+                    continue
                     
                 target_b = str(latest[active_filter_bucket])
-                if bucket_filter and target_b not in bucket_filter: continue
+                if bucket_filter and target_b not in bucket_filter:
+                    continue
                     
                 sub_hist = processed[processed[active_filter_bucket] == target_b].dropna(subset=['Fwd_5d', 'MAE_5d', 'Fwd_SMA5_Ret'])
                 if len(sub_hist) > 0:
@@ -1188,13 +1245,16 @@ with tab_screener:
                     "Hist 5D Profit Factor": h_pf, "Hist Avg Drawdown (%)": round(h_mae, 2) if pd.notna(h_mae) else np.nan,
                     "Hist SMA5 Exit Win Rate": round(h_sma5_wr, 1) if pd.notna(h_sma5_wr) else np.nan
                 })
-            except Exception: pass
+            except Exception:
+                pass
                 
         progress_bar.progress(100)
         status_text.empty()
         
-        if macro_color == "success": st.success(f"Macro Breadth Regime: {macro_tag} | {macro_desc}")
-        else: st.info(f"Macro Breadth Regime: {macro_tag} | {macro_desc}")
+        if macro_color == "success":
+            st.success(f"Macro Breadth Regime: {macro_tag} | {macro_desc}")
+        else:
+            st.info(f"Macro Breadth Regime: {macro_tag} | {macro_desc}")
         
         screen_df = pd.DataFrame(screener_rows)
         if not screen_df.empty:
