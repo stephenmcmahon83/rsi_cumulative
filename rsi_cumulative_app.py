@@ -33,6 +33,8 @@ EXIT_KEYS = (
     + ["FIX5", "FIX10"]
 )
 
+RSI_DAYS_MAP = {"2-Day RSI(2)": 2, "3-Day RSI(2)": 3, "5-Day RSI(2)": 5}
+
 def get_exit_label_map(rsi_name="5-Day RSI(2)"):
     """Returns human-readable exit labels dynamically matched to the chosen RSI lookback."""
     mapping = {
@@ -49,8 +51,60 @@ def get_exit_label_map(rsi_name="5-Day RSI(2)"):
     return mapping
 
 # ==========================================
-# 1. CORE QUANTITATIVE & EXECUTION ENGINE
+# 1. OHLCV EXTRACTION & CORE QUANT ENGINE
 # ==========================================
+
+OHLCV_NAMES = {'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume'}
+
+def normalize_ohlcv_df(df):
+    """
+    Safely flattens any yfinance DataFrame (single or multi-ticker, group_by='ticker' or 'column')
+    so that columns are guaranteed to be standard ['Open', 'High', 'Low', 'Close', ...].
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        lvl0 = set(df.columns.get_level_values(0))
+        lvl1 = set(df.columns.get_level_values(1))
+        if len(lvl0.intersection(OHLCV_NAMES)) >= 3:
+            df.columns = df.columns.get_level_values(0)
+        elif len(lvl1.intersection(OHLCV_NAMES)) >= 3:
+            df.columns = df.columns.get_level_values(1)
+        else:
+            df.columns = [c[0] for c in df.columns]
+
+    # Remove any duplicate columns and drop empty rows
+    df = df.loc[:, ~df.columns.duplicated()].dropna(how='all')
+    required = {'Open', 'High', 'Low', 'Close'}
+    if not required.issubset(set(df.columns)):
+        return pd.DataFrame()
+
+    return df
+
+def extract_symbol_daily(bulk_data, sym, total_tickers=1):
+    """Robustly extracts single-symbol daily OHLCV from bulk or single yfinance downloads."""
+    if bulk_data is None or bulk_data.empty:
+        return pd.DataFrame()
+    try:
+        if isinstance(bulk_data.columns, pd.MultiIndex):
+            lvl0 = bulk_data.columns.get_level_values(0)
+            lvl1 = bulk_data.columns.get_level_values(1)
+            if sym in lvl0:
+                sub = bulk_data[sym].copy()
+                return normalize_ohlcv_df(sub)
+            elif sym in lvl1:
+                sub = bulk_data.xs(sym, axis=1, level=1).copy()
+                return normalize_ohlcv_df(sub)
+            elif total_tickers == 1:
+                return normalize_ohlcv_df(bulk_data)
+        else:
+            if total_tickers == 1:
+                return normalize_ohlcv_df(bulk_data)
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 def calculate_wilders_rsi(prices, period=2):
     """Calculates standard Wilder's Smoothed RSI(2)."""
@@ -70,9 +124,9 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     Computes adjusted OHLC, N-day RSI(2) buckets, and Next-Open forward trade outcomes
     for all exit strategies.
     """
-    df = raw_df.copy()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [col[0] for col in df.columns]
+    df = normalize_ohlcv_df(raw_df)
+    if df.empty:
+        return pd.DataFrame()
 
     # Normalize OHLC for dividends/splits so Open and Close are on the exact same scale
     if 'Adj Close' in df.columns and 'Close' in df.columns:
@@ -142,7 +196,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
         if max_k < 1:
             continue
 
-        # Helper to record trade metrics when exit triggers on Close[i + k] -> Open[i + k + 1]
         def record_exit(key, k_steps):
             ex_idx = i + k_steps + 1
             exit_px = o_vals[ex_idx]
@@ -270,7 +323,7 @@ def build_entry_exit_matrix(filtered_df, metric_choice, exit_label_map):
     rows = []
     for b in BUCKET_LABELS:
         sub = filtered_df[filtered_df['Bucket'] == b]
-        row_dict = {"Entry Bucket": b, "Trades": int(sub[f'Ret_SMA5'].dropna().shape[0])}
+        row_dict = {"Entry Bucket": b, "Trades": int(sub['Ret_SMA5'].dropna().shape[0])}
         for k in EXIT_KEYS:
             n, wr, avg_r, pf, days, _ = summarize_series(
                 sub[f'Ret_{k}'], sub[f'Days_{k}'], sub[f'MAE_{k}']
@@ -297,7 +350,6 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
 
     dates = full_df.index
     opens = full_df['Open_Adj'].values
-    closes = full_df['Close_Adj'].values
 
     trade_rows = []
     for sig_date, row in sub.iterrows():
@@ -388,14 +440,13 @@ def run_portfolio_backtest_next_open(
         d = all_dates[idx]
         prev_d = all_dates[idx - 1]
 
-        # Step A: Check if any open position triggered an exit on prev_d Close -> Exit at today's Open (d)
+        # Step A: Process Exits at Today's Open (d) based on Yesterday's Close (prev_d)
         closed_tickers = []
         for ticker, pos in open_positions.items():
             df = prepared_dfs[ticker]
             if d not in df.index or prev_d not in df.index:
                 continue
 
-            # Only evaluate exit if position was entered on or before prev_d Open
             if pos['entry_date'] > prev_d:
                 continue
 
@@ -445,7 +496,7 @@ def run_portfolio_backtest_next_open(
         for t in closed_tickers:
             del open_positions[t]
 
-        # Step B: Identify Entry Signals from prev_d Close -> Enter at today's Open (d)
+        # Step B: Identify Entry Signals from prev_d Close -> Enter at Today's Open (d)
         available_slots = max_positions - len(open_positions)
         candidates = []
 
@@ -479,7 +530,6 @@ def run_portfolio_backtest_next_open(
 
             candidates.sort(key=lambda x: x['rsi_val'])
 
-            # Calculate current equity at Open to size new slots
             current_equity = cash
             for t_open, p_open in open_positions.items():
                 df_o = prepared_dfs[t_open]
@@ -622,38 +672,19 @@ def get_universe_tickers(universe_name):
 
 @st.cache_data(show_spinner=False)
 def fetch_daily_data(symbol, start, end):
-    df = yf.download(symbol, start=start, end=end, auto_adjust=False, progress=False)
-    if df.empty:
-        return None
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [col[0] for col in df.columns]
-    return df
-
-def extract_symbol_daily(bulk_data, sym, total_tickers):
-    try:
-        if total_tickers == 1:
-            df = bulk_data.copy()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-            return df.dropna(how='all')
-        if not isinstance(bulk_data.columns, pd.MultiIndex):
-            return pd.DataFrame()
-        if sym in bulk_data.columns.levels[0]:
-            return bulk_data[sym].copy().dropna(how='all')
-        elif sym in bulk_data.columns.levels[1]:
-            return bulk_data.xs(sym, axis=1, level=1).copy().dropna(how='all')
-    except Exception:
-        pass
-    return pd.DataFrame()
+    raw = yf.download(symbol, start=start, end=end, auto_adjust=False, progress=False)
+    df = normalize_ohlcv_df(raw)
+    return df if not df.empty else None
 
 # ==========================================
-# 4. INTERFACE TABS
+# 4. INTERFACE TABS (4 SEPARATE TABS)
 # ==========================================
 
-tab_study, tab_portfolio, tab_watchlist = st.tabs([
+tab_study, tab_watchlist, tab_screener, tab_portfolio = st.tabs([
     "📊 Single Ticker Study (Next-Open)",
-    "📁 Multi-Stock Portfolio Backtester",
-    "🔎 Watchlist & Live Screener"
+    "📋 Custom Watchlist Analyzer",
+    "🔎 Live Universe Screener",
+    "📁 Multi-Stock Portfolio Backtester"
 ])
 
 # ----------------------------------------------------
@@ -662,7 +693,6 @@ tab_study, tab_portfolio, tab_watchlist = st.tabs([
 with tab_study:
     st.subheader("Strategy Configuration")
 
-    # Top Control Row 1: Asset & Indicator
     c1, c2, c3, c4 = st.columns([1.0, 1.3, 1.5, 0.9])
     with c1:
         study_ticker = st.text_input("Ticker Symbol", value="META", key="study_sym").upper().strip()
@@ -682,12 +712,10 @@ with tab_study:
     with c4:
         years_back = st.number_input("History (Years)", min_value=1, max_value=30, value=20)
 
-    rsi_days_map = {"2-Day RSI(2)": 2, "3-Day RSI(2)": 3, "5-Day RSI(2)": 5}
-    active_rsi_days = rsi_days_map[rsi_choice]
+    active_rsi_days = RSI_DAYS_MAP[rsi_choice]
     exit_label_map = get_exit_label_map(rsi_choice)
     inv_exit_label_map = {v: k for k, v in exit_label_map.items()}
 
-    # Top Control Row 2: Exit Strategy, Entry Bucket Filter, and 200 SMA Gate
     c5, c6, c7 = st.columns([1.6, 1.6, 1.2])
     with c5:
         selected_exit_label = st.selectbox(
@@ -732,7 +760,6 @@ with tab_study:
         b_token = bucket_preset.replace("Bucket ", "").replace(" Only", "").strip()
         active_buckets = [b_token]
 
-    # Automatically fetch & process data (cached so changing dropdowns is instant)
     start_date = (datetime.now() - timedelta(days=years_back * 365)).strftime('%Y-%m-%d')
     end_date = datetime.now().strftime('%Y-%m-%d')
 
@@ -746,7 +773,6 @@ with tab_study:
         fresh_only = ("First Day" in signal_mode)
         filtered_df = filter_signal_rows(processed_df, require_uptrend=require_uptrend_study, fresh_only=fresh_only)
 
-        # Current Live Status Banner
         latest = processed_df.iloc[-1]
         curr_px = latest['Close_Adj']
         curr_rsi1 = latest['RSI2_1d']
@@ -812,12 +838,12 @@ with tab_study:
         # SECTION 2: EXIT STRATEGY COMPARISON
         # ==========================================
         st.divider()
-        bucket_title_str = ", ".join(active_buckets) if len(active_buckets) <= 3 else f"All 10 Buckets"
+        bucket_title_str = ", ".join(active_buckets) if len(active_buckets) <= 3 else "All 10 Buckets"
         st.subheader(f"2. Compare All Exit Rules — Entry Bucket(s): {bucket_title_str}")
 
         sub_tab1, sub_tab2 = st.tabs([
             f"📋 Exit Comparison Table (Entry: {bucket_title_str})",
-            f"🔢 Full Entry × Exit Grid (All Buckets vs. All Exits)"
+            "🔢 Full Entry × Exit Grid (All Buckets vs. All Exits)"
         ])
 
         with sub_tab1:
@@ -906,7 +932,280 @@ with tab_study:
                 st.dataframe(trades_df.sort_values(by="Signal Date (Close)", ascending=False), use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 2: MULTI-STOCK PORTFOLIO BACKTESTER
+# TAB 2: CUSTOM WATCHLIST ANALYZER
+# ----------------------------------------------------
+with tab_watchlist:
+    st.subheader("Custom Watchlist Analyzer (Next-Open Execution)")
+    st.caption(
+        "Enter one or more tickers to inspect their current RSI(2) bucket and historical Next-Open edge whenever they entered that exact bucket."
+    )
+
+    w_c1, w_c2, w_c3, w_c4 = st.columns([2.0, 1.1, 1.4, 0.8])
+    with w_c1:
+        w_input = st.text_input(
+            "Watchlist Tickers (comma or space separated)",
+            value="SPY, QQQ, IWM, META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA",
+            key="w_tickers_input"
+        )
+    with w_c2:
+        w_rsi_choice = st.selectbox("RSI(2) Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=2, key="w_rsi")
+        w_rsi_days = RSI_DAYS_MAP[w_rsi_choice]
+        w_exit_map = get_exit_label_map(w_rsi_choice)
+        w_inv_exit_map = {v: k for k, v in w_exit_map.items()}
+    with w_c3:
+        w_exit_label = st.selectbox("Benchmark Exit (Next Open)", list(w_exit_map.values()), index=0, key="w_exit")
+        w_exit_key = w_inv_exit_map[w_exit_label]
+    with w_c4:
+        w_years = st.number_input("History (Yrs)", min_value=2, max_value=25, value=10, key="w_yrs")
+
+    w_f1, w_f2 = st.columns(2)
+    with w_f1:
+        w_uptrend = st.checkbox("Require Historical Signals to be Above 200-Day SMA", value=True, key="w_trend")
+    with w_f2:
+        w_fresh = st.checkbox("First Day Entering Bucket Only (No Overlap)", value=False, key="w_fresh")
+
+    if st.button("Analyze Custom Watchlist", type="primary", use_container_width=True):
+        w_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', w_input) if s.strip()]))
+        if not w_list:
+            st.warning("Please enter at least one valid ticker symbol.")
+        else:
+            with st.spinner(f"Analyzing {len(w_list)} watchlist ticker(s)..."):
+                s_w = (datetime.now() - timedelta(days=w_years * 365)).strftime('%Y-%m-%d')
+                e_w = datetime.now().strftime('%Y-%m-%d')
+                bulk_w = yf.download(w_list, start=s_w, end=e_w, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+
+                rows = []
+                for sym in w_list:
+                    d_sym = extract_symbol_daily(bulk_w, sym, len(w_list))
+                    if len(d_sym) < 220:
+                        continue
+                    p_df = prepare_stock_data(d_sym, rsi_days=w_rsi_days)
+                    if p_df.empty:
+                        continue
+
+                    last = p_df.iloc[-1]
+                    c_b = str(last['Bucket'])
+
+                    hist = filter_signal_rows(p_df, require_uptrend=w_uptrend, fresh_only=w_fresh)
+                    sub_b = hist[hist['Bucket'] == c_b]
+                    n, wr, avg_r, pf, days, mae = summarize_series(
+                        sub_b[f'Ret_{w_exit_key}'], sub_b[f'Days_{w_exit_key}'], sub_b[f'MAE_{w_exit_key}']
+                    )
+
+                    rows.append({
+                        "Ticker": sym,
+                        "Last Close": round(last['Close_Adj'], 2),
+                        "1D RSI(2)": round(last['RSI2_1d'], 1),
+                        "2D RSI(2)": round(last['RSI2_2d'], 1),
+                        "3D RSI(2)": round(last['RSI2_3d'], 1),
+                        "5D RSI(2)": round(last['RSI2_5d'], 1),
+                        f"Current Bucket ({w_rsi_choice})": c_b,
+                        "> 200 SMA": "Yes" if bool(last['Above_200SMA']) else "No",
+                        "Prior 5D (%)": round(last['Prior_5d'], 2),
+                        "Hist Trades (in Bucket)": n,
+                        "Hist Win Rate (%)": wr,
+                        "Hist Avg Ret (%)": avg_r,
+                        "Hist Profit Factor": pf,
+                        "Hist Avg Hold (Days)": days,
+                        "Hist Avg Drawdown (%)": mae
+                    })
+
+                if not rows:
+                    st.error("Could not retrieve sufficient trading history (minimum 220 days) for the entered ticker(s).")
+                else:
+                    scan_df = pd.DataFrame(rows).sort_values(by=f"{w_rsi_days}D RSI(2)", ascending=True)
+                    w_col_cfg = {
+                        "Last Close": st.column_config.NumberColumn(format="$%.2f"),
+                        "1D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                        "2D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                        "3D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                        "5D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                        "Prior 5D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "Hist Trades (in Bucket)": st.column_config.NumberColumn(format="%d"),
+                        "Hist Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+                        "Hist Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "Hist Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                        "Hist Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
+                        "Hist Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%")
+                    }
+                    st.dataframe(scan_df, column_config=w_col_cfg, use_container_width=True)
+                    st.download_button(
+                        label="Download Watchlist Results (CSV)",
+                        data=scan_df.to_csv(index=False).encode('utf-8'),
+                        file_name="watchlist_next_open_results.csv",
+                        mime="text/csv"
+                    )
+
+# ----------------------------------------------------
+# TAB 3: LIVE UNIVERSE SCREENER
+# ----------------------------------------------------
+with tab_screener:
+    st.subheader("Live Index Universe Screener (Next-Open Execution)")
+    st.caption(
+        "Scans an entire index universe for stocks currently sitting in your target RSI(2) entry buckets as of the latest Close."
+    )
+
+    s_c1, s_c2, s_c3, s_c4 = st.columns([1.2, 1.1, 1.4, 1.4])
+    with s_c1:
+        scr_universe = st.selectbox(
+            "Select Index Universe",
+            ["Major ETFs", "Dow Jones 30", "Nasdaq 100", "S&P 500", "Russell 2000 (Small Caps)"],
+            index=2,
+            key="scr_univ"
+        )
+    with s_c2:
+        scr_rsi_choice = st.selectbox(
+            "RSI(2) Lookback",
+            ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
+            index=2,
+            key="scr_rsi"
+        )
+        scr_rsi_days = RSI_DAYS_MAP[scr_rsi_choice]
+        scr_exit_map = get_exit_label_map(scr_rsi_choice)
+        scr_inv_exit_map = {v: k for k, v in scr_exit_map.items()}
+    with s_c3:
+        scr_buckets = st.multiselect(
+            "Filter Active Entry Buckets",
+            options=BUCKET_LABELS,
+            default=['<10', '11-20'],
+            key="scr_buckets"
+        )
+    with s_c4:
+        scr_exit_label = st.selectbox(
+            "Benchmark Exit (Next Open)",
+            list(scr_exit_map.values()),
+            index=0,
+            key="scr_exit"
+        )
+        scr_exit_key = scr_inv_exit_map[scr_exit_label]
+
+    s_f1, s_f2, s_f3 = st.columns([1.4, 1.4, 1.0])
+    with s_f1:
+        scr_uptrend_gate = st.checkbox(
+            "Enforce Close > 200-Day SMA Gate (Today & Historical)",
+            value=True,
+            key="scr_trend"
+        )
+    with s_f2:
+        scr_fresh_gate = st.checkbox(
+            "Only Show Fresh Entries Today (Just Entered Bucket on Latest Close)",
+            value=False,
+            key="scr_fresh"
+        )
+    with s_f3:
+        scr_years = st.number_input("Historical Backtest Depth (Yrs)", min_value=2, max_value=15, value=5, key="scr_yrs")
+
+    if st.button("🔎 Run Live Universe Screen", type="primary", use_container_width=True):
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        status_text.text("Checking S&P 500 (SPY) broad market regime...")
+        spy_df = fetch_daily_data(
+            "SPY",
+            (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
+            datetime.now().strftime('%Y-%m-%d')
+        )
+        spy_rsi5 = np.nan
+        if spy_df is not None and len(spy_df) >= 200:
+            spy_prep = prepare_stock_data(spy_df, rsi_days=5)
+            spy_rsi5 = spy_prep['RSI2_5d'].iloc[-1]
+
+        progress_bar.progress(15)
+        status_text.text(f"Loading constituent list for {scr_universe}...")
+        u_tickers = get_universe_tickers(scr_universe)
+
+        progress_bar.progress(30)
+        status_text.text(f"Downloading historical daily data for {len(u_tickers)} tickers...")
+        s_sc = (datetime.now() - timedelta(days=scr_years * 365)).strftime('%Y-%m-%d')
+        e_sc = datetime.now().strftime('%Y-%m-%d')
+        bulk_sc = yf.download(u_tickers, start=s_sc, end=e_sc, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+
+        progress_bar.progress(75)
+        status_text.text("Filtering active setups and computing Next-Open historical expectancy...")
+
+        screen_rows = []
+        for sym in u_tickers:
+            d_sym = extract_symbol_daily(bulk_sc, sym, len(u_tickers))
+            if len(d_sym) < 220:
+                continue
+            p_df = prepare_stock_data(d_sym, rsi_days=scr_rsi_days)
+            if p_df.empty:
+                continue
+
+            last = p_df.iloc[-1]
+            prev = p_df.iloc[-2]
+            c_b = str(last['Bucket'])
+            is_bull = bool(last['Above_200SMA'])
+
+            if scr_uptrend_gate and not is_bull:
+                continue
+            if scr_buckets and c_b not in scr_buckets:
+                continue
+            if scr_fresh_gate and str(prev['Bucket']) == c_b:
+                continue
+
+            hist = filter_signal_rows(p_df, require_uptrend=scr_uptrend_gate, fresh_only=scr_fresh_gate)
+            sub_b = hist[hist['Bucket'] == c_b]
+            n, wr, avg_r, pf, days, mae = summarize_series(
+                sub_b[f'Ret_{scr_exit_key}'], sub_b[f'Days_{scr_exit_key}'], sub_b[f'MAE_{scr_exit_key}']
+            )
+
+            screen_rows.append({
+                "Ticker": sym,
+                "Last Close": round(last['Close_Adj'], 2),
+                "1D RSI(2)": round(last['RSI2_1d'], 1),
+                "2D RSI(2)": round(last['RSI2_2d'], 1),
+                "3D RSI(2)": round(last['RSI2_3d'], 1),
+                "5D RSI(2)": round(last['RSI2_5d'], 1),
+                f"Active Bucket ({scr_rsi_choice})": c_b,
+                "> 200 SMA": "Yes" if is_bull else "No",
+                "Prior 5D (%)": round(last['Prior_5d'], 2),
+                "Hist Trades": n,
+                "Hist Win Rate (%)": wr,
+                "Hist Avg Ret (%)": avg_r,
+                "Hist Profit Factor": pf,
+                "Hist Avg Hold (Days)": days,
+                "Hist Avg Drawdown (%)": mae
+            })
+
+        progress_bar.progress(100)
+        status_text.empty()
+
+        if pd.notna(spy_rsi5):
+            if spy_rsi5 <= 25:
+                st.success(f"**Macro Context**: Systemic Oversold Flush (SPY 5-Day RSI(2) = {spy_rsi5:.1f}). Broad market mean-reversion tailwinds active.")
+            else:
+                st.info(f"**Macro Context**: Neutral / Bullish Market Breadth (SPY 5-Day RSI(2) = {spy_rsi5:.1f}). Pullbacks are stock-specific.")
+
+        if not screen_rows:
+            st.info(f"No stocks in **{scr_universe}** currently match the selected bucket and trend filters.")
+        else:
+            st.subheader(f"Filtered Setups Found: {len(screen_rows)} Tickers")
+            scr_df = pd.DataFrame(screen_rows).sort_values(by=f"{scr_rsi_days}D RSI(2)", ascending=True)
+            scr_col_cfg = {
+                "Last Close": st.column_config.NumberColumn(format="$%.2f"),
+                "1D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                "2D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                "3D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                "5D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
+                "Prior 5D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Hist Trades": st.column_config.NumberColumn(format="%d"),
+                "Hist Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+                "Hist Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                "Hist Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                "Hist Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
+                "Hist Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%")
+            }
+            st.dataframe(scr_df, column_config=scr_col_cfg, use_container_width=True)
+            st.download_button(
+                label="Download Screener Matches (CSV)",
+                data=scr_df.to_csv(index=False).encode('utf-8'),
+                file_name=f"screener_{scr_universe.lower().replace(' ', '_')}.csv",
+                mime="text/csv"
+            )
+
+# ----------------------------------------------------
+# TAB 4: MULTI-STOCK PORTFOLIO BACKTESTER
 # ----------------------------------------------------
 with tab_portfolio:
     st.subheader("Multi-Stock Portfolio Backtester (Next-Open Execution)")
@@ -928,7 +1227,7 @@ with tab_portfolio:
     p_c4, p_c5, p_c6, p_c7 = st.columns([1.1, 1.3, 1.5, 0.9])
     with p_c4:
         port_rsi_choice = st.selectbox("RSI(2) Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=0, key="p_rsi")
-        port_rsi_days = rsi_days_map[port_rsi_choice]
+        port_rsi_days = RSI_DAYS_MAP[port_rsi_choice]
         port_exit_map = get_exit_label_map(port_rsi_choice)
         port_inv_exit_map = {v: k for k, v in port_exit_map.items()}
     with p_c5:
@@ -957,12 +1256,12 @@ with tab_portfolio:
             lim = 30 if "30" in port_pool_limit else (50 if "50" in port_pool_limit else 100)
             tickers_list = roster[:lim]
         else:
-            tickers_list = [s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_custom) if s.strip()]
+            tickers_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_custom) if s.strip()]))
 
         if not tickers_list or not port_buckets:
             st.warning("Please select at least one ticker and one entry bucket.")
         else:
-            with st.spinner(f"Downloading data and simulating Next-Open portfolio across {len(tickers_list)} tickers..."):
+            with st.spinner(f"Downloading data and simulating Next-Open portfolio across {len(tickers_list)} ticker(s)..."):
                 s_p = (datetime.now() - timedelta(days=port_years * 365)).strftime('%Y-%m-%d')
                 e_p = datetime.now().strftime('%Y-%m-%d')
                 bulk_p = yf.download(tickers_list, start=s_p, end=e_p, group_by="ticker", auto_adjust=False, progress=False, threads=True)
@@ -971,7 +1270,9 @@ with tab_portfolio:
                 for sym in tickers_list:
                     d_sym = extract_symbol_daily(bulk_p, sym, len(tickers_list))
                     if len(d_sym) >= 220:
-                        prep_dict[sym] = prepare_stock_data(d_sym, rsi_days=port_rsi_days)
+                        p_df = prepare_stock_data(d_sym, rsi_days=port_rsi_days)
+                        if not p_df.empty:
+                            prep_dict[sym] = p_df
 
             if not prep_dict:
                 st.error("Could not load sufficient data for the selected tickers.")
@@ -1007,63 +1308,3 @@ with tab_portfolio:
                     if not p_tr_df.empty:
                         with st.expander(f"View Portfolio Trade Log ({len(p_tr_df)} Closed Trades)"):
                             st.dataframe(p_tr_df.sort_values(by="Exit Date (Open)", ascending=False), use_container_width=True)
-
-# ----------------------------------------------------
-# TAB 3: WATCHLIST & LIVE SCREENER
-# ----------------------------------------------------
-with tab_watchlist:
-    st.subheader("Watchlist & Universe Scanner")
-    w_c1, w_c2, w_c3 = st.columns([2.2, 1.2, 1.2])
-    with w_c1:
-        w_input = st.text_input("Tickers to Scan", value="SPY, QQQ, IWM, META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AMD")
-    with w_c2:
-        w_rsi_choice = st.selectbox("RSI(2) Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=0, key="w_rsi")
-        w_rsi_days = rsi_days_map[w_rsi_choice]
-        w_exit_map = get_exit_label_map(w_rsi_choice)
-        w_inv_exit_map = {v: k for k, v in w_exit_map.items()}
-    with w_c3:
-        w_exit_label = st.selectbox("Benchmark Exit (Next Open)", list(w_exit_map.values()), index=0, key="w_exit")
-        w_exit_key = w_inv_exit_map[w_exit_label]
-
-    if st.button("Scan Tickers", type="primary", use_container_width=True):
-        w_list = [s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', w_input) if s.strip()]
-        if w_list:
-            with st.spinner("Scanning daily data..."):
-                s_w = (datetime.now() - timedelta(days=10 * 365)).strftime('%Y-%m-%d')
-                e_w = datetime.now().strftime('%Y-%m-%d')
-                bulk_w = yf.download(w_list, start=s_w, end=e_w, group_by="ticker", auto_adjust=False, progress=False, threads=True)
-
-                rows = []
-                for sym in w_list:
-                    d_sym = extract_symbol_daily(bulk_w, sym, len(w_list))
-                    if len(d_sym) < 220:
-                        continue
-                    p_df = prepare_stock_data(d_sym, rsi_days=w_rsi_days)
-                    last = p_df.iloc[-1]
-                    c_b = str(last['Bucket'])
-
-                    hist = filter_signal_rows(p_df, require_uptrend=True, fresh_only=False)
-                    sub_b = hist[hist['Bucket'] == c_b]
-                    n, wr, avg_r, pf, days, mae = summarize_series(
-                        sub_b[f'Ret_{w_exit_key}'], sub_b[f'Days_{w_exit_key}'], sub_b[f'MAE_{w_exit_key}']
-                    )
-
-                    rows.append({
-                        "Ticker": sym,
-                        "Last Close": round(last['Close_Adj'], 2),
-                        "1D RSI(2)": round(last['RSI2_1d'], 1),
-                        "2D RSI(2)": round(last['RSI2_2d'], 1),
-                        "3D RSI(2)": round(last['RSI2_3d'], 1),
-                        "5D RSI(2)": round(last['RSI2_5d'], 1),
-                        f"Active Bucket ({w_rsi_choice})": c_b,
-                        "> 200 SMA": "Yes" if bool(last['Above_200SMA']) else "No",
-                        "Hist Signals": n,
-                        "Hist Win Rate (%)": wr,
-                        "Hist Avg Ret (%)": avg_r,
-                        "Hist Profit Factor": pf,
-                        "Hist Avg Hold (Days)": days
-                    })
-
-                if rows:
-                    scan_df = pd.DataFrame(rows).sort_values(by=f"{w_rsi_days}D RSI(2)", ascending=True)
-                    st.dataframe(scan_df, use_container_width=True)
