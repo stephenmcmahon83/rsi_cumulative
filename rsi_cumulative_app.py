@@ -3,6 +3,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import requests
 import re
@@ -75,7 +76,6 @@ def normalize_ohlcv_df(df):
         else:
             df.columns = [c[0] for c in df.columns]
 
-    # Remove any duplicate columns and drop empty rows
     df = df.loc[:, ~df.columns.duplicated()].dropna(how='all')
     required = {'Open', 'High', 'Low', 'Close'}
     if not required.issubset(set(df.columns)):
@@ -128,7 +128,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     if df.empty:
         return pd.DataFrame()
 
-    # Normalize OHLC for dividends/splits so Open and Close are on the exact same scale
     if 'Adj Close' in df.columns and 'Close' in df.columns:
         adj_ratio = (df['Adj Close'] / df['Close']).replace([np.inf, -np.inf], 1.0).fillna(1.0)
         df['Open_Adj'] = df['Open'] * adj_ratio
@@ -171,8 +170,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     df['Bucket'] = pd.cut(df['Active_RSI'], bins=bins, labels=BUCKET_LABELS)
 
     # 5. Next-Open Entry & Next-Open Exit Simulation
-    # Signal at Close[i] -> Enter at Open[i+1]
-    # Exit Signal at Close[i+k] (k >= 1) -> Exit at Open[i+k+1]
     n = len(df)
     o_vals = open_s.values
     l_vals = low_s.values
@@ -255,6 +252,148 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
 
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
+
+# ==========================================
+# CANDLESTICK + 2-DAY & 5-DAY RSI(2) CHART
+# ==========================================
+
+def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
+    """
+    Creates a 3-row synchronized Plotly chart:
+      Row 1: Daily Candlestick Price Action + 5-Day SMA & 200-Day SMA
+      Row 2: 2-Day RSI(2) with horizontal lines at 10, 20, 80, 90
+      Row 3: 5-Day RSI(2) with horizontal lines at 10, 20, 80, 90
+    """
+    plot_df = df.iloc[-lookback_bars:].copy() if lookback_bars and len(df) > lookback_bars else df.copy()
+
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        row_heights=[0.52, 0.24, 0.24],
+        subplot_titles=(
+            f"{ticker} Daily Candlestick Price Action (with 5-SMA & 200-SMA)",
+            "2-Day Average RSI(2)  [Lines at 10, 20, 80, 90]",
+            "5-Day Average RSI(2)  [Lines at 10, 20, 80, 90]"
+        )
+    )
+
+    # --- ROW 1: Daily Candlesticks & Moving Averages ---
+    fig.add_trace(
+        go.Candlestick(
+            x=plot_df.index,
+            open=plot_df['Open_Adj'],
+            high=plot_df['High_Adj'],
+            low=plot_df['Low_Adj'],
+            close=plot_df['Close_Adj'],
+            name="Price (Adj)",
+            increasing_line_color="#00E676",
+            decreasing_line_color="#FF5252"
+        ),
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df.index,
+            y=plot_df['SMA_5'],
+            mode='lines',
+            name='5-Day SMA',
+            line=dict(color='#29B6F6', width=1.4)
+        ),
+        row=1, col=1
+    )
+
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df.index,
+            y=plot_df['SMA_200'],
+            mode='lines',
+            name='200-Day SMA',
+            line=dict(color='#FFA726', width=1.8, dash='dot')
+        ),
+        row=1, col=1
+    )
+
+    # --- ROW 2: 2-Day RSI(2) ---
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df.index,
+            y=plot_df['RSI2_2d'],
+            mode='lines',
+            name='2-Day RSI(2)',
+            line=dict(color='#CE93D8', width=2.0)
+        ),
+        row=2, col=1
+    )
+
+    # --- ROW 3: 5-Day RSI(2) ---
+    fig.add_trace(
+        go.Scatter(
+            x=plot_df.index,
+            y=plot_df['RSI2_5d'],
+            mode='lines',
+            name='5-Day RSI(2)',
+            line=dict(color='#4DD0E1', width=2.0)
+        ),
+        row=3, col=1
+    )
+
+    # Add Horizontal Lines at 10, 20, 80, 90 to both RSI subplots (Rows 2 and 3)
+    threshold_styles = [
+        (90, "#FF1744", "solid", "90"),
+        (80, "#FF9100", "dash",  "80"),
+        (20, "#00E5FF", "dash",  "20"),
+        (10, "#00E676", "solid", "10"),
+    ]
+
+    for r_idx in [2, 3]:
+        # Shaded Overbought (80-90+) and Oversold (10-20) bands for instant visual clarity
+        fig.add_hrect(y0=80, y1=90, fillcolor="#FF5252", opacity=0.08, line_width=0, row=r_idx, col=1)
+        fig.add_hrect(y0=90, y1=100, fillcolor="#FF1744", opacity=0.14, line_width=0, row=r_idx, col=1)
+        fig.add_hrect(y0=10, y1=20, fillcolor="#00E5FF", opacity=0.08, line_width=0, row=r_idx, col=1)
+        fig.add_hrect(y0=0,  y1=10, fillcolor="#00E676", opacity=0.14, line_width=0, row=r_idx, col=1)
+
+        for lvl, color, dash_style, label_txt in threshold_styles:
+            fig.add_hline(
+                y=lvl,
+                line_dash=dash_style,
+                line_color=color,
+                line_width=1.2,
+                row=r_idx,
+                col=1
+            )
+
+        fig.update_yaxes(
+            range=[0, 100],
+            tickvals=[10, 20, 50, 80, 90],
+            title_text="RSI(2)",
+            row=r_idx,
+            col=1
+        )
+
+    fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+
+    # Hide weekend gaps and disable the bottom candlestick range slider
+    fig.update_xaxes(
+        rangebreaks=[dict(bounds=["sat", "mon"])],
+        rangeslider_visible=False
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=760,
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=20, r=20, t=55, b=20)
+    )
+
+    return fig
+
+# ==========================================
+# 2. TABLE & SUMMARY BUILDERS
+# ==========================================
 
 def filter_signal_rows(df, require_uptrend=True, fresh_only=False):
     """Applies trend and fresh-entry filters to valid signal rows."""
@@ -414,7 +553,7 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
     return pd.DataFrame(yearly_rows).set_index("Year"), trades_df
 
 # ==========================================
-# 2. MULTI-STOCK PORTFOLIO ENGINE (NEXT OPEN)
+# 3. MULTI-STOCK PORTFOLIO ENGINE (NEXT OPEN)
 # ==========================================
 
 def run_portfolio_backtest_next_open(
@@ -422,11 +561,6 @@ def run_portfolio_backtest_next_open(
     max_positions=5, initial_capital=100000.0,
     require_uptrend=True, fresh_entry_only=True
 ):
-    """
-    Day-by-day portfolio simulation using strict Next-Open execution:
-    - Exits execute at Today's Open if Yesterday's Close triggered the exit rule.
-    - Entries execute at Today's Open if Yesterday's Close triggered the entry bucket.
-    """
     all_dates = sorted(list(set.union(*[set(df.index) for df in prepared_dfs.values()])))
     if len(all_dates) < 3:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -624,7 +758,7 @@ def run_portfolio_backtest_next_open(
     return pd.DataFrame(yearly_records).set_index("Year"), equity_df, trades_df
 
 # ==========================================
-# 3. DATA FETCHING & CACHING
+# 4. DATA FETCHING & CACHING
 # ==========================================
 
 DJIA_FALLBACK = [
@@ -677,7 +811,7 @@ def fetch_daily_data(symbol, start, end):
     return df if not df.empty else None
 
 # ==========================================
-# 4. INTERFACE TABS (4 SEPARATE TABS)
+# 5. INTERFACE TABS (4 SEPARATE TABS)
 # ==========================================
 
 tab_study, tab_watchlist, tab_screener, tab_portfolio = st.tabs([
@@ -688,7 +822,7 @@ tab_study, tab_watchlist, tab_screener, tab_portfolio = st.tabs([
 ])
 
 # ----------------------------------------------------
-# TAB 1: SINGLE TICKER STUDY (SIMPLIFIED & PERSISTENT)
+# TAB 1: SINGLE TICKER STUDY (WITH CANDLESTICK & RSI SUBPLOTS)
 # ----------------------------------------------------
 with tab_study:
     st.subheader("Strategy Configuration")
@@ -788,6 +922,39 @@ with tab_study:
         m3.metric(f"Current {rsi_choice}", f"{curr_rsi_n:.1f}")
         m4.metric(f"{rsi_choice} Bucket", curr_bucket)
         m5.metric("200-Day SMA Trend", "Above (Bullish)" if is_bull else "Below (Bearish)")
+
+        # ==========================================
+        # PRICE CANDLESTICK & 2D / 5D RSI(2) SUBPLOTS
+        # ==========================================
+        st.divider()
+        ch_col1, ch_col2 = st.columns([2.8, 1.2])
+        with ch_col1:
+            st.subheader(f"📈 {study_ticker} Daily Candlestick & Multi-Day RSI(2) Oscillators")
+        with ch_col2:
+            chart_zoom = st.selectbox(
+                "Chart Display Window",
+                [
+                    "Last 3 Months (~63 Bars)",
+                    "Last 6 Months (~126 Bars)",
+                    "Last 1 Year (~252 Bars)",
+                    "Last 2 Years (~504 Bars)",
+                    "Full Backtest History"
+                ],
+                index=1,
+                key="chart_zoom_window"
+            )
+
+        zoom_map = {
+            "Last 3 Months (~63 Bars)": 63,
+            "Last 6 Months (~126 Bars)": 126,
+            "Last 1 Year (~252 Bars)": 252,
+            "Last 2 Years (~504 Bars)": 504,
+            "Full Backtest History": None
+        }
+        fig_candles = build_candlestick_and_rsi_chart(
+            processed_df, study_ticker, lookback_bars=zoom_map[chart_zoom]
+        )
+        st.plotly_chart(fig_candles, use_container_width=True)
 
         # ==========================================
         # SECTION 1: ENTRY BUCKET BREAKDOWN
