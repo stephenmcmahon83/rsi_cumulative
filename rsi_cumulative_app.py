@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import requests
+import io
 import re
 
 st.set_page_config(page_title="RSI(2) Next-Open Backtester & Exit Monitor", layout="wide")
@@ -50,6 +51,146 @@ def get_exit_label_map(rsi_name="5-Day RSI(2)"):
     mapping["FIX5"] = "Fixed 5-Day Hold"
     mapping["FIX10"] = "Fixed 10-Day Hold"
     return mapping
+
+# ==========================================
+# COMPREHENSIVE BUILT-IN UNIVERSE ROSTERS
+# ==========================================
+
+DJIA_30_TICKERS = [
+    "AAPL", "AMGN", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS",
+    "GS", "HD", "HON", "IBM", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
+    "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT"
+]
+
+MAJOR_ETFS_105 = [
+    # Broad US Indices & Style/Factors
+    "SPY", "QQQ", "IWM", "DIA", "MDY", "IJH", "IJR", "VTI", "VOO", "RSP",
+    "QQQM", "IVV", "SCHD", "VUG", "VTV", "VIG", "QUAL", "MTUM", "USMV", "SPLV",
+    "IWF", "IWD", "IWO", "IWN", "IWP", "IWS", "ARKK", "ARKW",
+    # S&P 500 Sectors
+    "XLK", "XLF", "XLV", "XLE", "XLY", "XLI", "XLP", "XLU", "XLB", "XLRE", "XLC",
+    # Sub-Sectors, Industries & Thematic
+    "SMH", "SOXX", "IGV", "CIBR", "HACK", "SKYY", "BOTZ", "IBB", "XBI", "IHI",
+    "XPH", "KRE", "KBE", "IAI", "KIE", "ITB", "XHB", "VNQ", "IYR", "XRT",
+    "RTH", "XOP", "OIH", "AMLP", "XME", "GDX", "GDXJ", "SIL", "COPX", "URA",
+    "URNM", "ITA", "XAR", "JETS", "IYT", "XTN", "TAN", "ICLN", "LIT", "PAVE", "GRID",
+    # Fixed Income / Treasury / Credit
+    "TLT", "IEF", "SHY", "AGG", "BND", "LQD", "HYG", "JNK", "TIP", "EMB", "MBB",
+    # Commodities, Currencies & Crypto
+    "GLD", "IAU", "SLV", "USO", "UNG", "DBC", "PDBC", "DBA", "UUP", "IBIT", "FBTC", "BITO",
+    # International & Country ETFs
+    "EFA", "VEA", "EEM", "VWO", "FXI", "KWEB", "MCHI", "EWJ", "EWZ", "EWY",
+    "INDA", "EWG", "EWU", "EWC", "EWA", "EWW", "EWT", "EZU", "FEZ"
+]
+
+NASDAQ_100_TICKERS = [
+    "AAPL", "ABNB", "ADBE", "ADI", "ADP", "ADSK", "AEP", "AMAT", "AMD", "AMGN",
+    "AMZN", "ANSS", "APP", "ARM", "ASML", "AVGO", "AZN", "BIIB", "BKNG", "BKR",
+    "CCEP", "CDNS", "CDW", "CEG", "CHTR", "CMCSA", "COST", "CPRT", "CRWD", "CSCO",
+    "CSGP", "CSX", "CTAS", "CTSH", "DASH", "DDOG", "DLTR", "DXCM", "EA", "EXC",
+    "FANG", "FAST", "FTNT", "GEHC", "GFS", "GILD", "GOOG", "GOOGL", "HON", "IDXX",
+    "INTC", "INTU", "ISRG", "KDP", "KHC", "KLAC", "LIN", "LRCX", "LULU", "MAR",
+    "MCHP", "MDB", "MDLZ", "MELI", "META", "MNST", "MRNA", "MRVL", "MSFT", "MU",
+    "NFLX", "NVDA", "NXPI", "ODFL", "ON", "ORLY", "PANW", "PAYX", "PCAR", "PDD",
+    "PEP", "PLTR", "PYPL", "QCOM", "REGN", "ROP", "ROST", "SBUX", "SMCI", "SNPS",
+    "TEAM", "TMUS", "TSLA", "TTD", "TTWO", "TXN", "VRSK", "VRTX", "WBD", "WDAY",
+    "XEL", "ZS"
+]
+
+SP500_FULL_FALLBACK = [
+    "A", "AAPL", "ABBV", "ABNB", "ABT", "ACGL", "ACN", "ADBE", "ADI", "ADM",
+    "ADP", "ADSK", "AEE", "AEP", "AES", "AFL", "AIG", "AIZ", "AJG", "AKAM",
+    "ALB", "ALGN", "ALL", "ALLE", "AMAT", "AMCR", "AMD", "AME", "AMGN", "AMP",
+    "AMT", "AMZN", "ANET", "ANSS", "AON", "AOS", "APA", "APD", "APH", "APO",
+    "APTV", "ARE", "ATO", "AVB", "AVGO", "AVY", "AWK", "AXON", "AXP", "AZO",
+    "BA", "BAC", "BALL", "BAX", "BBY", "BDX", "BEN", "BF-B", "BG", "BIIB",
+    "BK", "BKNG", "BKR", "BLDR", "BLK", "BMY", "BR", "BRK-B", "BRO", "BSX",
+    "BWA", "BX", "BXP", "C", "CAG", "CAH", "CARR", "CAT", "CB", "CBOE",
+    "CBRE", "CCI", "CCL", "CDNS", "CDW", "CE", "CEG", "CF", "CFG", "CHD",
+    "CHRW", "CHTR", "CI", "CINF", "CL", "CLX", "CMCSA", "CME", "CMG", "CMI",
+    "CMS", "CNC", "CNP", "COF", "COO", "COP", "COR", "COST", "CPAY", "CPB",
+    "CPRT", "CPT", "CRL", "CRM", "CRWD", "CSCO", "CSGP", "CSX", "CTAS", "CTRA",
+    "CTSH", "CTVA", "CVS", "CVX", "CZR", "D", "DAL", "DAY", "DD", "DE",
+    "DECK", "DELL", "DFS", "DG", "DGX", "DHI", "DHR", "DIS", "DLR", "DLTR",
+    "DOC", "DOV", "DOW", "DPZ", "DRI", "DTE", "DUK", "DVA", "DVN", "DXCM",
+    "EA", "EBAY", "ECL", "ED", "EFX", "EG", "EIX", "EL", "ELV", "EMN",
+    "EMR", "ENPH", "EOG", "EPAM", "EQIX", "EQR", "EQT", "ERIE", "ES", "ESS",
+    "ETN", "ETR", "EVRG", "EW", "EXC", "EXPD", "EXPE", "EXR", "F", "FANG",
+    "FAST", "FCX", "FDS", "FDX", "FE", "FFIV", "FI", "FICO", "FIS", "FITB",
+    "FMC", "FOX", "FOXA", "FRT", "FSLR", "FTNT", "FTV", "GD", "GDDY", "GE",
+    "GEHC", "GEN", "GEV", "GILD", "GIS", "GL", "GLW", "GM", "GNRC", "GOOG",
+    "GOOGL", "GPC", "GPN", "GRMN", "GS", "GWW", "HAL", "HAS", "HBAN", "HCA",
+    "HD", "HES", "HIG", "HII", "HLT", "HOLX", "HON", "HPE", "HPQ", "HRL",
+    "HSIC", "HST", "HSY", "HUBB", "HUM", "HWM", "IBM", "ICE", "IDXX", "IEX",
+    "IFF", "INCY", "INTC", "INTU", "INVH", "IP", "IPG", "IQV", "IR", "IRM",
+    "ISRG", "IT", "ITW", "IVZ", "J", "JBHT", "JBL", "JCI", "JKHY", "JNJ",
+    "JNPR", "JPM", "K", "KDP", "KEY", "KEYS", "KHC", "KIM", "KKR", "KLAC",
+    "KMB", "KMI", "KMX", "KO", "KR", "KVUE", "L", "LDOS", "LEN", "LH",
+    "LHX", "LIN", "LKQ", "LLY", "LMT", "LNT", "LOW", "LRCX", "LULU", "LUV",
+    "LVS", "LW", "LYB", "LYV", "MA", "MAA", "MAR", "MAS", "MCD", "MCHP",
+    "MCK", "MCO", "MDLZ", "MDT", "MET", "META", "MGM", "MHK", "MKC", "MKTX",
+    "MLM", "MMC", "MMM", "MNST", "MO", "MOH", "MOS", "MPC", "MPWR", "MRK",
+    "MRNA", "MS", "MSCI", "MSFT", "MSI", "MTB", "MTCH", "MTD", "MU", "NCLH",
+    "NDAQ", "NDSN", "NEE", "NEM", "NFLX", "NI", "NKE", "NOC", "NOW", "NRG",
+    "NSC", "NTAP", "NTRS", "NUE", "NVDA", "NVR", "NWS", "NWSA", "NXPI", "O",
+    "ODFL", "OKE", "OMC", "ON", "ORCL", "ORLY", "OTIS", "OXY", "PANW", "PARA",
+    "PAYC", "PAYX", "PCAR", "PCG", "PEG", "PEP", "PFE", "PFG", "PG", "PGR",
+    "PH", "PHM", "PKG", "PLD", "PLTR", "PM", "PNC", "PNR", "PNW", "PODD",
+    "POOL", "PPG", "PPL", "PRU", "PSA", "PSX", "PTC", "PWR", "PYPL", "QCOM",
+    "RCL", "REG", "REGN", "RF", "RJF", "RL", "RMD", "ROK", "ROL", "ROP",
+    "ROST", "RSG", "RTX", "RVTY", "SBAC", "SBUX", "SCHW", "SHW", "SJM", "SLB",
+    "SMCI", "SNA", "SNPS", "SO", "SOLV", "SPG", "SPGI", "SRE", "STE", "STLD",
+    "STT", "STX", "STZ", "SW", "SWK", "SWKS", "SYF", "SYK", "SYY", "T",
+    "TAP", "TDG", "TDY", "TECH", "TEL", "TER", "TFC", "TFX", "TGT", "TJX",
+    "TMO", "TMUS", "TPR", "TRGP", "TRMB", "TROW", "TRV", "TSCO", "TSLA", "TSN",
+    "TT", "TTWO", "TXN", "TXT", "TYL", "UAL", "UBER", "UDR", "UHS", "ULTA",
+    "UNH", "UNP", "UPS", "URI", "USB", "V", "VICI", "VLO", "VLTO", "VMC",
+    "VRSK", "VRSN", "VRTX", "VST", "VTR", "VTRS", "VZ", "WAB", "WAT", "WBA",
+    "WBD", "WDAY", "WDC", "WEC", "WELL", "WFC", "WM", "WMB", "WMT", "WRB",
+    "WST", "WTW", "WY", "WYNN", "XEL", "XOM", "XYL", "YUM", "ZBH", "ZBRA", "ZTS"
+]
+
+RUSSELL_SMALLCAP_FALLBACK = [
+    "AAON", "AAT", "ABCB", "ABG", "ABM", "ACA", "ACAD", "ACHC", "ACIW", "ACLS",
+    "ADEA", "ADMA", "ADNT", "ADUS", "AEIS", "AEO", "AESI", "AGCO", "AGYS", "AHCO",
+    "AIN", "AIR", "AIT", "AKR", "AL", "ALEX", "ALG", "ALGT", "ALK", "ALKT",
+    "ALRM", "ALTR", "AMBA", "AMBC", "AMED", "AMKR", "AMN", "AMPH", "AMRC", "AMRX",
+    "AMSF", "AMT", "AMWD", "ANDE", "ANF", "ANIP", "AORT", "AOSL", "APAM", "APGE",
+    "APLE", "APOG", "APPF", "APPN", "ARCB", "ARCH", "ARCT", "ARES", "ARHS", "ARKO",
+    "ARLO", "ARMK", "AROC", "ARR", "ARVN", "ARWR", "ASB", "ASGN", "ASH", "ASIX",
+    "ASPN", "ASTEC", "ATEN", "ATGE", "ATI", "ATKR", "ATMU", "ATNI", "ATRC", "ATRI",
+    "ATRO", "ATSG", "AVA", "AVAV", "AVNS", "AVNT", "AVO", "AVPT", "AVXL", "AWR",
+    "AX", "AXGN", "AXNX", "AXSM", "AYI", "AZEK", "AZTA", "B", "BANC", "BANF",
+    "BANR", "BCC", "BCML", "BCO", "BCPC", "BCRX", "BDC", "BE", "BEAM", "BECN",
+    "BELFB", "BFH", "BFS", "BGC", "BGS", "BHE", "BHLB", "BHVN", "BIGC", "BJRI",
+    "BKE", "BKH", "BKU", "BL", "BLBD", "BLD", "BLFS", "BLKB", "BLMN", "BLX",
+    "BMI", "BMRC", "BOH", "BOKF", "BOOT", "BOX", "BPMC", "BPOP", "PRVA", "BRBR",
+    "BRC", "BRKL", "BRKR", "BRSP", "BRX", "BRZE", "BSIG", "BSM", "BTU", "BTSG",
+    "BUSE", "BV", "BWA", "BWB", "BWFG", "BWIN", "BWXT", "BXMT", "BY", "BYD",
+    "BYON", "CACI", "CADE", "CAKE", "CAL", "CALM", "CALX", "CAMT", "CAR", "CARG",
+    "CARS", "CASY", "CATY", "CBAN", "CBRL", "CBSH", "CBT", "CBU", "CBZ", "CC",
+    "CCB", "CCBG", "CCOI", "CCRN", "CCS", "CDE", "CDMO", "CDNA", "CDP", "CEIX",
+    "CELH", "CENT", "CENTA", "CENX", "CERS", "CEVA", "CFB", "CFFN", "CHCO", "CHCT",
+    "CHE", "CHEF", "CHH", "CHRD", "CHUY", "CHX", "CIEN", "CIM", "CIVB", "CIVI",
+    "CLB", "CLBK", "CLDT", "CLFD", "CLH", "CLNE", "CLSK", "CLVT", "CMC", "CMCO",
+    "CMP", "CMPR", "CMRE", "CMTG", "CNK", "CNMD", "CNNE", "CNO", "CNOB", "CNS",
+    "CNX", "CNXC", "CNXN", "COHU", "COKE", "COLB", "COLL", "COLM", "COMM", "COMP",
+    "COOP", "CORT", "CPF", "CPK", "CPRX", "CPS", "CR", "CRAI", "CRBG", "CRC",
+    "CRDO", "CRGY", "CRI", "CRK", "CRL", "CRMT", "CRNX", "CROX", "CRS", "CRSR",
+    "CRUS", "CRVL", "CSGS", "CSR", "CSTE", "CSTL", "CSTM", "CSV", "CSWI", "CTBI",
+    "CTKB", "CTLP", "CTO", "CTOS", "CTRE", "CTS", "CUBI", "CVBF", "CVCO", "CVCY",
+    "CVGW", "CVI", "CVLG", "CVLT", "CW", "CWAN", "CWCO", "CWEN", "CWH", "CWK",
+    "CWST", "CWT", "CXM", "CXW", "CYRX", "CYTK", "DAN", "DAR", "DCOM", "orm",
+    "DDS", "DEA", "DEI", "DFH", "DFIN", "DGICA", "DGII", "DHC", "DHIL", "DHT",
+    "DIN", "DIOD", "DJCO", "DK", "DKL", "DLB", "DLO", "DMLP", "DMRC", "DNLI",
+    "DNOW", "DNUT", "DOCN", "DOCS", "DOLE", "DOMO", "TALO", "TKR", "TXG", "UMBF",
+    "URBN", "VSAT", "VVI", "WING", "WNS", "ZETA", "ZWS", "EAT", "EPRT", "EXPO",
+    "FCFS", "FN", "FROG", "GKOS", "GTLS", "HAE", "HALO", "HQY", "IDCC", "ITGR",
+    "JXN", "KNF", "KNSL", "KNTK", "KRYS", "KYMR", "LSTR", "LTH", "MEDP", "MOG-A",
+    "MRC", "NEOG", "NSIT", "NVST", "OII", "ONB", "ORA", "OSCR", "PACS", "PBF",
+    "PCVX", "POWI", "PTGX", "QTWO", "RBA", "RHP", "SAIA", "SLAB", "SM", "SPSC",
+    "STRL", "TGTX", "TTAN", "TWST"
+]
 
 # ==========================================
 # 1. OHLCV EXTRACTION & CORE QUANT ENGINE
@@ -108,8 +249,8 @@ def extract_symbol_daily(bulk_data, sym, total_tickers=1):
 
 def calculate_wilders_rsi_with_state(prices, period=2):
     """
-    Calculates standard Wilder's Smoothed RSI(2) and also returns the avg_gain and avg_loss
-    series so we can algebraically solve for exact next-bar RSI target exit prices.
+    Calculates standard Wilder's Smoothed RSI(2) and returns avg_gain and avg_loss
+    so we can algebraically solve for exact next-bar RSI target exit prices.
     """
     delta = prices.diff()
     gain = delta.clip(lower=0)
@@ -129,7 +270,6 @@ def calculate_wilders_rsi(prices, period=2):
 def solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, current_rsi, target_rsi):
     """
     Computes the exact Next-Day Close Price required for 1-Day Wilder's RSI(2) to reach `target_rsi`.
-    For period=2 (alpha=0.5), RS_next = (avg_gain + gain_next) / (avg_loss + loss_next).
     """
     if pd.isna(last_close) or pd.isna(avg_gain) or pd.isna(avg_loss):
         return np.nan
@@ -139,11 +279,9 @@ def solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, current_rsi, targe
     rs_target = target_rsi / (100.0 - target_rsi)
 
     if target_rsi > current_rsi:
-        # Requires a positive price change (gain_next > 0, loss_next = 0)
         req_gain = rs_target * avg_loss - avg_gain
         return max(0.01, float(last_close + max(0.0, req_gain)))
     else:
-        # Can still achieve target_rsi even if price drops by req_loss
         if rs_target <= 0:
             return np.nan
         req_loss = (avg_gain / rs_target) - avg_loss
@@ -153,7 +291,6 @@ def solve_next_close_for_nday_rsi2(last_close, avg_gain, avg_loss, recent_rsi_li
     """
     Computes the exact Next-Day Close Price required so the N-Day Average RSI(2)
     crosses `target_avg_rsi` on tomorrow's close.
-    Returns np.nan if mathematically unreachable in a single session (e.g. requires 1D RSI > 99.9).
     """
     if n_days == 1:
         return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], target_avg_rsi)
@@ -162,10 +299,8 @@ def solve_next_close_for_nday_rsi2(last_close, avg_gain, avg_loss, recent_rsi_li
     req_1d_rsi = (n_days * target_avg_rsi) - prior_sum
 
     if req_1d_rsi <= 0.1:
-        # Will exceed threshold even on a sharp drop; compute floor price where 1D RSI = 0.5
         return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], 0.5)
     elif req_1d_rsi >= 99.9:
-        # Cannot reach target N-day average in a single bar even with a massive rally
         return np.nan
     else:
         return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], req_1d_rsi)
@@ -176,13 +311,16 @@ def compute_ticker_snapshot_row(raw_df, sym, active_rsi_days=2, custom_exit_rsi_
     for the Universe Monitor and Watchlist tables.
     """
     df = normalize_ohlcv_df(raw_df)
-    if len(df) < 205:
+    if len(df) < 200:
         return None
 
     if 'Adj Close' in df.columns and 'Close' in df.columns:
-        close_s = df['Adj Close']
+        close_s = df['Adj Close'].dropna()
     else:
-        close_s = df['Close']
+        close_s = df['Close'].dropna()
+
+    if len(close_s) < 200:
+        return None
 
     rsi_s, avg_gain_s, avg_loss_s = calculate_wilders_rsi_with_state(close_s, period=2)
     rsi_2d = rsi_s.rolling(2).mean()
@@ -214,7 +352,6 @@ def compute_ticker_snapshot_row(raw_df, sym, active_rsi_days=2, custom_exit_rsi_
     bucket_str = str(pd.cut([active_r], bins=bins, labels=BUCKET_LABELS)[0])
 
     cur_sma5 = float(sma5.iloc[-1])
-    # Exact close needed tomorrow so Close[t+1] > SMA5[t+1] is the mean of the last 4 closes
     next_sma5_trigger = float(close_s.iloc[-4:].mean())
     pct_to_sma5 = (cur_sma5 - last_c) / last_c * 100.0
 
@@ -333,7 +470,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     low_s = df['Low_Adj']
     close_s = df['Close_Adj']
 
-    # 1. Single-Bar and Multi-Day RSI(2)
     df['RSI2_1d'] = calculate_wilders_rsi(close_s, period=2)
     df['RSI2_2d'] = df['RSI2_1d'].rolling(window=2).mean()
     df['RSI2_3d'] = df['RSI2_1d'].rolling(window=3).mean()
@@ -342,7 +478,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     active_rsi_col = f'RSI2_{rsi_days}d'
     df['Active_RSI'] = df[active_rsi_col]
 
-    # 2. Moving Averages & X-Day High Closes
     df['SMA_5'] = close_s.rolling(window=5).mean()
     df['SMA_200'] = close_s.rolling(window=200).mean()
     df['Above_200SMA'] = close_s > df['SMA_200']
@@ -350,15 +485,12 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     for x in HIGH_CLOSE_WINDOWS:
         df[f'HighClose_{x}d'] = close_s.rolling(window=x).max()
 
-    # 3. Trailing Returns for Context
     df['Prior_5d'] = (close_s - close_s.shift(5)) / close_s.shift(5) * 100
     df['Prior_10d'] = (close_s - close_s.shift(10)) / close_s.shift(10) * 100
 
-    # 4. Discrete 10-Point Buckets (<10, 11-20, ..., 91-100)
     bins = [-0.001, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.001]
     df['Bucket'] = pd.cut(df['Active_RSI'], bins=bins, labels=BUCKET_LABELS)
 
-    # 5. Next-Open Entry & Next-Open Exit Simulation
     n = len(df)
     o_vals = open_s.values
     l_vals = low_s.values
@@ -391,7 +523,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
             worst_low = min(np.min(l_vals[ent_idx:ex_idx]), exit_px)
             mae_arrays[key][i] = min(0.0, (worst_low - entry_px) / entry_px * 100.0)
 
-        # A. Close > 5-Day SMA
         for k in range(1, max_k + 1):
             if c_vals[i + k] > sma5_vals[i + k]:
                 record_exit("SMA5", k)
@@ -400,7 +531,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
             if i + max_hold + 1 < n:
                 record_exit("SMA5", max_hold)
 
-        # B. Close at X-Day High Close
         for x in HIGH_CLOSE_WINDOWS:
             key = f"HC{x}"
             hc_arr = hc_vals[x]
@@ -412,7 +542,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
                 if i + max_hold + 1 < n:
                     record_exit(key, max_hold)
 
-        # C. Selected N-Day RSI(2) > Threshold (10, 20, ..., 90)
         untriggered = set(RSI_THRESHOLDS)
         for k in range(1, max_k + 1):
             r_val = rsi_vals[i + k]
@@ -426,7 +555,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
             for t in untriggered:
                 record_exit(f"RSI_{t}", max_hold)
 
-        # D. Fixed 5-Day & 10-Day Holds (Open[i+1] to Open[i+1+M])
         if i + 6 < n:
             record_exit("FIX5", 5)
         if i + 11 < n:
@@ -925,50 +1053,124 @@ def run_portfolio_backtest_next_open(
     return pd.DataFrame(yearly_records).set_index("Year"), equity_df, trades_df
 
 # ==========================================
-# 4. DATA FETCHING & CACHING
+# 4. ZERO-LXML UNIVERSE FETCHERS & CACHING
 # ==========================================
 
-DJIA_FALLBACK = [
-    "AAPL", "AMZN", "AXP", "BA", "CAT", "CRM", "CSCO", "CVX", "DIS", "GS",
-    "HD", "HON", "IBM", "INTC", "JNJ", "JPM", "KO", "MCD", "MMM", "MRK",
-    "MSFT", "NKE", "NVDA", "PG", "SHW", "TRV", "UNH", "V", "VZ", "WMT"
-]
+def parse_wiki_tickers_regex(url):
+    """
+    Zero-dependency HTML parser that extracts stock symbols from Wikipedia constituent tables
+    without needing `lxml` or `beautifulsoup4`.
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return []
+        tables = re.findall(r'<table[^>]*class="[^"]*wikitable sortable[^"]*"[^>]*>(.*?)</table>', resp.text, re.DOTALL)
+        for tbl in tables:
+            rows = re.findall(r'<tr[^>]*>(.*?)</tr>', tbl, re.DOTALL)
+            if len(rows) < 25:
+                continue
+            header_cells = [
+                re.sub(r'<[^>]+>', '', c).strip()
+                for c in re.findall(r'<th[^>]*>(.*?)</th>', rows[0], re.DOTALL)
+            ]
+            sym_idx = None
+            for idx, h in enumerate(header_cells):
+                if h.lower() in ('symbol', 'ticker', 'ticker symbol'):
+                    sym_idx = idx
+                    break
+            if sym_idx is None:
+                continue
+            tickers = []
+            for r in rows[1:]:
+                cols = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', r, re.DOTALL)
+                if len(cols) > sym_idx:
+                    raw_sym = re.sub(r'<[^>]+>', '', cols[sym_idx]).strip().upper().replace('.', '-')
+                    if re.match(r'^[A-Z]{1,5}(-[A-Z])?$', raw_sym):
+                        tickers.append(raw_sym)
+            if len(tickers) >= 25:
+                return list(dict.fromkeys(tickers))
+    except Exception:
+        pass
+    return []
 
-RUSSELL_FALLBACK = [
-    "BTSG", "FROG", "TWST", "GKOS", "UMBF", "SM", "PCVX", "FCFS", "EAT",
-    "PBF", "CTRE", "ONB", "KRYS", "TXG", "JXN", "LTH", "KYMR", "PTGX", "KNTK",
-    "CYTK", "TGTX", "IDCC", "VSAT", "ZETA", "RHP", "ZWS", "HQY", "URBN", "SLAB"
-]
+def fetch_ishares_russell2000():
+    """
+    Fetches the full ~1,950 Russell 2000 constituent list directly from BlackRock/iShares IWM ETF CSV.
+    """
+    url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            lines = resp.text.splitlines()
+            start_idx = None
+            for i, line in enumerate(lines[:30]):
+                if line.startswith("Ticker,") or '"Ticker"' in line:
+                    start_idx = i
+                    break
+            if start_idx is not None:
+                csv_df = pd.read_csv(io.StringIO("\n".join(lines[start_idx:])))
+                if 'Ticker' in csv_df.columns:
+                    if 'Asset Class' in csv_df.columns:
+                        csv_df = csv_df[csv_df['Asset Class'].astype(str).str.contains('Equity', case=False, na=False)]
+                    raw_syms = csv_df['Ticker'].dropna().astype(str).tolist()
+                    cleaned = []
+                    for s in raw_syms:
+                        s_clean = s.strip().upper().replace('.', '-').replace(' ', '-')
+                        if re.match(r'^[A-Z]{1,5}(-[A-Z])?$', s_clean) and s_clean not in ('-', 'USD'):
+                            cleaned.append(s_clean)
+                    if len(cleaned) >= 500:
+                        return list(dict.fromkeys(cleaned))
+    except Exception:
+        pass
+    return []
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_universe_tickers(universe_name):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    def extract_wiki(url):
+    """Returns comprehensive constituent lists for each selected universe."""
+    if universe_name == "S&P 500":
+        # 1. Try GitHub CSV dataset (no lxml needed)
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                for df in pd.read_html(resp.text):
-                    for col in ['Symbol', 'Ticker']:
-                        if col in df.columns:
-                            return [s.replace('.', '-') for s in df[col].dropna().astype(str).tolist()]
+            url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+            df_sp = pd.read_csv(url)
+            if 'Symbol' in df_sp.columns and len(df_sp) >= 490:
+                syms = [s.strip().upper().replace('.', '-') for s in df_sp['Symbol'].dropna().astype(str)]
+                return list(dict.fromkeys(syms + SP500_FULL_FALLBACK))
         except Exception:
             pass
-        return []
+        # 2. Try Wikipedia Regex Parser
+        wiki_sp = parse_wiki_tickers_regex("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        if len(wiki_sp) >= 490:
+            return list(dict.fromkeys(wiki_sp + SP500_FULL_FALLBACK))
+        # 3. Guaranteed 500+ Built-In S&P 500 Roster
+        return list(dict.fromkeys(SP500_FULL_FALLBACK))
 
-    if universe_name == "S&P 500":
-        res = extract_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        return res if res else DJIA_FALLBACK
     elif universe_name == "Nasdaq 100":
-        res = extract_wiki("https://en.wikipedia.org/wiki/Nasdaq-100")
-        return res if res else ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO", "COST", "AMD"]
+        wiki_nq = parse_wiki_tickers_regex("https://en.wikipedia.org/wiki/Nasdaq-100")
+        if len(wiki_nq) >= 95:
+            return list(dict.fromkeys(wiki_nq + NASDAQ_100_TICKERS))
+        return list(dict.fromkeys(NASDAQ_100_TICKERS))
+
     elif universe_name == "Dow Jones 30":
-        res = extract_wiki("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
-        return res if res else DJIA_FALLBACK
+        wiki_dj = parse_wiki_tickers_regex("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average")
+        if len(wiki_dj) == 30:
+            return wiki_dj
+        return list(dict.fromkeys(DJIA_30_TICKERS))
+
     elif "Russell 2000" in universe_name:
-        res = extract_wiki("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")
-        return list(dict.fromkeys(res + RUSSELL_FALLBACK)) if res else RUSSELL_FALLBACK
-    elif universe_name == "Major ETFs":
-        return ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLK", "XLV", "XLY", "XLI", "XLP", "XLU", "XLB", "SMH", "TLT", "GLD"]
+        # 1. Try Official iShares Russell 2000 (IWM) CSV (~1,950 stocks)
+        iwm_tickers = fetch_ishares_russell2000()
+        if len(iwm_tickers) >= 500:
+            return iwm_tickers
+        # 2. Combine Wikipedia S&P 600 SmallCap + Built-in Small-Cap Roster (~650+ stocks)
+        wiki_sc = parse_wiki_tickers_regex("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")
+        return list(dict.fromkeys(wiki_sc + RUSSELL_SMALLCAP_FALLBACK))
+
+    elif "Major ETFs" in universe_name:
+        return list(dict.fromkeys(MAJOR_ETFS_105))
+
     return []
 
 @st.cache_data(show_spinner=False)
@@ -978,15 +1180,15 @@ def fetch_daily_data(symbol, start, end):
     return df if not df.empty else None
 
 @st.cache_data(show_spinner=False, ttl=1800)
-def fetch_bulk_recent_data(tickers_tuple, days_back=420):
-    """Cached bulk downloader for fast Universe & Watchlist snapshot generation."""
-    tickers_list = list(tickers_tuple)
-    if not tickers_list:
+def fetch_chunk_recent_data(tickers_tuple, days_back=340):
+    """Cached batch downloader for a chunk of tickers."""
+    t_list = list(tickers_tuple)
+    if not t_list:
         return pd.DataFrame()
     s_d = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
     e_d = datetime.now().strftime('%Y-%m-%d')
     return yf.download(
-        tickers_list,
+        t_list,
         start=s_d,
         end=e_d,
         group_by="ticker",
@@ -994,6 +1196,51 @@ def fetch_bulk_recent_data(tickers_tuple, days_back=420):
         progress=False,
         threads=True
     )
+
+def load_universe_snapshots_batched(tickers_list, active_rsi_days, custom_exit_days, custom_exit_thresh, batch_size=125):
+    """
+    Downloads and computes snapshot rows across large universes (100 to 2,000 stocks)
+    in fast cached batches with a visual progress bar.
+    """
+    total = len(tickers_list)
+    if total == 0:
+        return []
+
+    rows = []
+    chunks = [tickers_list[i:i + batch_size] for i in range(0, total, batch_size)]
+
+    prog_bar = st.progress(0) if total > batch_size else None
+    status_txt = st.empty() if total > batch_size else None
+
+    for idx, chunk in enumerate(chunks):
+        if status_txt is not None:
+            status_txt.caption(
+                f"Loading batch {idx + 1} of {len(chunks)} ({min((idx + 1) * batch_size, total)} / {total} tickers)..."
+            )
+        bulk_chunk = fetch_chunk_recent_data(tuple(chunk), days_back=340)
+        for sym in chunk:
+            d_sym = extract_symbol_daily(bulk_chunk, sym, len(chunk))
+            if d_sym.empty:
+                continue
+            r_data = compute_ticker_snapshot_row(
+                d_sym,
+                sym,
+                active_rsi_days=active_rsi_days,
+                custom_exit_rsi_days=custom_exit_days,
+                custom_exit_thresh=custom_exit_thresh
+            )
+            if r_data is not None:
+                rows.append(r_data)
+
+        if prog_bar is not None:
+            prog_bar.progress((idx + 1) / len(chunks))
+
+    if prog_bar is not None:
+        prog_bar.empty()
+    if status_txt is not None:
+        status_txt.empty()
+
+    return rows
 
 # ==========================================
 # 5. INTERFACE TABS (4 SEPARATE TABS)
@@ -1284,24 +1531,51 @@ with tab_study:
                 st.dataframe(trades_df.sort_values(by="Signal Date (Close)", ascending=False), use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 2: UNIVERSE MONITOR & EXIT PRICES (ALL TICKERS)
+# TAB 2: UNIVERSE MONITOR & EXIT PRICES (EXPANDED ROSTERS)
 # ----------------------------------------------------
 with tab_screener:
     st.subheader("🌐 Full Universe Monitor — Current RSI Readings & Target Exit Prices")
     st.caption(
-        "Select any universe from the dropdown to list ALL constituent tickers, their live 1D/2D/3D/5D RSI(2) readings, "
+        "Select any universe from the dropdown to list all constituent tickers, their live 1D/2D/3D/5D RSI(2) readings, "
         "and exact target exit prices ($). Click any column header in the table to sort ascending or descending."
     )
 
-    u_c1, u_c2, u_c3, u_c4, u_c5 = st.columns([1.3, 1.1, 1.1, 1.1, 1.2])
+    u_c1, u_c2, u_c3, u_c4, u_c5, u_c6 = st.columns([1.3, 1.1, 1.0, 1.0, 1.0, 1.1])
     with u_c1:
         mon_universe = st.selectbox(
             "1. Select Universe",
-            ["Major ETFs", "Dow Jones 30", "Nasdaq 100", "Russell 2000 (Small Caps)", "S&P 500"],
-            index=1,
+            [
+                "Major ETFs (105 ETFs)",
+                "Dow Jones 30",
+                "Nasdaq 100",
+                "S&P 500",
+                "Russell 2000 (Small Caps)"
+            ],
+            index=2,
             key="mon_univ_select"
         )
     with u_c2:
+        # Map display label back to canonical universe key
+        univ_key = "Major ETFs" if "Major ETFs" in mon_universe else mon_universe
+        full_u_roster = get_universe_tickers(univ_key)
+        total_avail = len(full_u_roster)
+
+        if total_avail > 150:
+            size_options = [f"All Constituents ({total_avail})", "Top 100", "Top 250", "Top 500"]
+            size_choice = st.selectbox("Constituent Batch Limit", size_options, index=0, key="mon_batch_lim")
+            if "100" in size_choice:
+                u_tickers = full_u_roster[:100]
+            elif "250" in size_choice:
+                u_tickers = full_u_roster[:250]
+            elif "500" in size_choice:
+                u_tickers = full_u_roster[:500]
+            else:
+                u_tickers = full_u_roster
+        else:
+            st.text_input("Universe Size", value=f"{total_avail} Tickers", disabled=True)
+            u_tickers = full_u_roster
+
+    with u_c3:
         mon_bucket_rsi = st.selectbox(
             "Bucket RSI Lookback",
             ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
@@ -1309,44 +1583,32 @@ with tab_screener:
             key="mon_b_rsi"
         )
         mon_b_days = RSI_DAYS_MAP[mon_bucket_rsi]
-    with u_c3:
+    with u_c4:
         mon_custom_exit_days = st.selectbox(
-            "Custom Exit RSI Lookback",
+            "Custom Exit RSI",
             [1, 2, 3, 5],
             index=1,
             format_func=lambda x: f"{x}-Day RSI(2)",
             key="mon_cx_days"
         )
-    with u_c4:
+    with u_c5:
         mon_custom_exit_thresh = st.selectbox(
-            "Custom Exit RSI Threshold",
+            "Custom Exit Threshold",
             RSI_THRESHOLDS,
-            index=6,  # Default > 70
+            index=6,
             format_func=lambda x: f"RSI > {x}",
             key="mon_cx_thresh"
         )
-    with u_c5:
-        mon_search = st.text_input("Quick Filter Ticker (Optional)", value="", placeholder="e.g. AAPL, NVDA", key="mon_search")
+    with u_c6:
+        mon_search = st.text_input("Filter Ticker (Optional)", value="", placeholder="e.g. AAPL, NVDA", key="mon_search")
 
-    u_tickers = get_universe_tickers(mon_universe)
-
-    with st.spinner(f"Loading live RSI & Exit Price snapshot for all {len(u_tickers)} tickers in {mon_universe}..."):
-        bulk_univ_df = fetch_bulk_recent_data(tuple(u_tickers), days_back=420)
-
-        univ_rows = []
-        for sym in u_tickers:
-            d_sym = extract_symbol_daily(bulk_univ_df, sym, len(u_tickers))
-            if d_sym.empty:
-                continue
-            row_data = compute_ticker_snapshot_row(
-                d_sym,
-                sym,
-                active_rsi_days=mon_b_days,
-                custom_exit_rsi_days=mon_custom_exit_days,
-                custom_exit_thresh=mon_custom_exit_thresh
-            )
-            if row_data is not None:
-                univ_rows.append(row_data)
+    univ_rows = load_universe_snapshots_batched(
+        u_tickers,
+        active_rsi_days=mon_b_days,
+        custom_exit_days=mon_custom_exit_days,
+        custom_exit_thresh=mon_custom_exit_thresh,
+        batch_size=125
+    )
 
     if not univ_rows:
         st.error(f"Could not load market data for {mon_universe}.")
@@ -1354,7 +1616,6 @@ with tab_screener:
         full_univ_df = pd.DataFrame(univ_rows)
         custom_col_label = f"Exit: {mon_custom_exit_days}D RSI>{mon_custom_exit_thresh} ($)"
 
-        # Optional Quick-Sort & Filter Bar
         sort_c1, sort_c2, sort_c3 = st.columns([1.6, 1.0, 1.8])
         with sort_c1:
             default_sort_col = st.selectbox(
@@ -1368,7 +1629,7 @@ with tab_screener:
         with sort_c3:
             trend_filter_mode = st.radio(
                 "Display Scope",
-                ["All Tickers in Universe", "Only Above 200D SMA", "Only Oversold (<20 RSI)"],
+                ["All Tickers in Universe", "Only Above 200D SMA", "Only Oversold (≤20 RSI)"],
                 horizontal=True,
                 key="mon_scope_mode"
             )
@@ -1381,15 +1642,14 @@ with tab_screener:
 
         if trend_filter_mode == "Only Above 200D SMA":
             display_univ_df = display_univ_df[display_univ_df["% vs 200 SMA"] > 0]
-        elif trend_filter_mode == "Only Oversold (<20 RSI)":
+        elif trend_filter_mode == "Only Oversold (≤20 RSI)":
             display_univ_df = display_univ_df[display_univ_df[f"{mon_b_days}D RSI(2)"] <= 20.0]
 
         asc_bool = ("Ascending" in sort_dir)
         display_univ_df = display_univ_df.sort_values(by=default_sort_col, ascending=asc_bool, na_position='last').reset_index(drop=True)
 
-        # Summary Metrics Banner
         s_m1, s_m2, s_m3, s_m4 = st.columns(4)
-        s_m1.metric("Tickers Listed", f"{len(display_univ_df)} / {len(full_univ_df)}")
+        s_m1.metric("Tickers Displayed", f"{len(display_univ_df)} / {len(full_univ_df)}")
         s_m2.metric("Oversold (2D RSI ≤ 20)", f"{int((full_univ_df['2D RSI(2)'] <= 20).sum())}")
         s_m3.metric("Oversold (5D RSI ≤ 20)", f"{int((full_univ_df['5D RSI(2)'] <= 20).sum())}")
         s_m4.metric("Above 200-Day SMA", f"{(full_univ_df['% vs 200 SMA'] > 0).mean() * 100:.1f}%")
@@ -1399,13 +1659,13 @@ with tab_screener:
             column_config=get_snapshot_column_config(custom_col_label),
             hide_index=True,
             use_container_width=True,
-            height=620
+            height=640
         )
 
         st.download_button(
-            label=f"📥 Download {mon_universe} RSI & Exit Price Table (CSV)",
+            label=f"📥 Download {mon_universe} RSI & Exit Price Table ({len(display_univ_df)} Tickers CSV)",
             data=display_univ_df.to_csv(index=False).encode('utf-8'),
-            file_name=f"{mon_universe.lower().replace(' ', '_')}_exit_prices.csv",
+            file_name=f"{univ_key.lower().replace(' ', '_')}_exit_prices.csv",
             mime="text/csv"
         )
 
@@ -1439,22 +1699,13 @@ with tab_watchlist:
     if not w_list:
         st.warning("Please enter at least one valid ticker symbol.")
     else:
-        with st.spinner(f"Loading RSI readings and Exit Target Prices for {len(w_list)} watchlist ticker(s)..."):
-            bulk_w_df = fetch_bulk_recent_data(tuple(w_list), days_back=420)
-            w_rows = []
-            for sym in w_list:
-                d_sym = extract_symbol_daily(bulk_w_df, sym, len(w_list))
-                if d_sym.empty:
-                    continue
-                row_data = compute_ticker_snapshot_row(
-                    d_sym,
-                    sym,
-                    active_rsi_days=w_b_days,
-                    custom_exit_rsi_days=w_cx_days,
-                    custom_exit_thresh=w_cx_thresh
-                )
-                if row_data is not None:
-                    w_rows.append(row_data)
+        w_rows = load_universe_snapshots_batched(
+            w_list,
+            active_rsi_days=w_b_days,
+            custom_exit_days=w_cx_days,
+            custom_exit_thresh=w_cx_thresh,
+            batch_size=100
+        )
 
         if not w_rows:
             st.error("Could not retrieve sufficient trading history for the entered ticker(s).")
@@ -1495,7 +1746,7 @@ with tab_portfolio:
         else:
             port_custom = st.text_input("Tickers (comma-separated)", value="META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX")
     with p_col3:
-        port_pool_limit = st.selectbox("Max Universe Candidates", ["Top 30 Liquid", "Top 50 Liquid", "Top 100 Liquid"], index=0)
+        port_pool_limit = st.selectbox("Max Universe Candidates", ["Top 50 Liquid", "Top 100 Liquid", "Top 250 Liquid", "Full Universe"], index=1)
 
     p_c4, p_c5, p_c6, p_c7 = st.columns([1.1, 1.3, 1.5, 0.9])
     with p_c4:
@@ -1526,8 +1777,14 @@ with tab_portfolio:
     if st.button("🚀 Run Next-Open Portfolio Simulation", type="primary", use_container_width=True):
         if port_source == "Index Universe":
             roster = get_universe_tickers(port_univ)
-            lim = 30 if "30" in port_pool_limit else (50 if "50" in port_pool_limit else 100)
-            tickers_list = roster[:lim]
+            if "50" in port_pool_limit:
+                tickers_list = roster[:50]
+            elif "100" in port_pool_limit:
+                tickers_list = roster[:100]
+            elif "250" in port_pool_limit:
+                tickers_list = roster[:250]
+            else:
+                tickers_list = roster
         else:
             tickers_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_custom) if s.strip()]))
 
