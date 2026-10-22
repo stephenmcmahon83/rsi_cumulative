@@ -8,9 +8,9 @@ from datetime import datetime, timedelta
 import requests
 import re
 
-st.set_page_config(page_title="RSI(2) Next-Open Backtester", layout="wide")
+st.set_page_config(page_title="RSI(2) Next-Open Backtester & Exit Monitor", layout="wide")
 
-st.title("RSI(2) Quantitative Backtester (Next-Open Execution)")
+st.title("RSI(2) Quantitative Backtester & Live Exit Price Monitor")
 st.caption(
     "Execution Model: Entry Signal on Close → Buy Next Day Open | "
     "Exit Signal on Close → Sell Next Day Open"
@@ -106,8 +106,11 @@ def extract_symbol_daily(bulk_data, sym, total_tickers=1):
         pass
     return pd.DataFrame()
 
-def calculate_wilders_rsi(prices, period=2):
-    """Calculates standard Wilder's Smoothed RSI(2)."""
+def calculate_wilders_rsi_with_state(prices, period=2):
+    """
+    Calculates standard Wilder's Smoothed RSI(2) and also returns the avg_gain and avg_loss
+    series so we can algebraically solve for exact next-bar RSI target exit prices.
+    """
     delta = prices.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -117,7 +120,193 @@ def calculate_wilders_rsi(prices, period=2):
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(100)
+    return rsi.fillna(100), avg_gain, avg_loss
+
+def calculate_wilders_rsi(prices, period=2):
+    rsi, _, _ = calculate_wilders_rsi_with_state(prices, period=period)
+    return rsi
+
+def solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, current_rsi, target_rsi):
+    """
+    Computes the exact Next-Day Close Price required for 1-Day Wilder's RSI(2) to reach `target_rsi`.
+    For period=2 (alpha=0.5), RS_next = (avg_gain + gain_next) / (avg_loss + loss_next).
+    """
+    if pd.isna(last_close) or pd.isna(avg_gain) or pd.isna(avg_loss):
+        return np.nan
+    if target_rsi <= 0.0 or target_rsi >= 100.0:
+        return np.nan
+
+    rs_target = target_rsi / (100.0 - target_rsi)
+
+    if target_rsi > current_rsi:
+        # Requires a positive price change (gain_next > 0, loss_next = 0)
+        req_gain = rs_target * avg_loss - avg_gain
+        return max(0.01, float(last_close + max(0.0, req_gain)))
+    else:
+        # Can still achieve target_rsi even if price drops by req_loss
+        if rs_target <= 0:
+            return np.nan
+        req_loss = (avg_gain / rs_target) - avg_loss
+        return max(0.01, float(last_close - max(0.0, req_loss)))
+
+def solve_next_close_for_nday_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list, n_days, target_avg_rsi):
+    """
+    Computes the exact Next-Day Close Price required so the N-Day Average RSI(2)
+    crosses `target_avg_rsi` on tomorrow's close.
+    Returns np.nan if mathematically unreachable in a single session (e.g. requires 1D RSI > 99.9).
+    """
+    if n_days == 1:
+        return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], target_avg_rsi)
+
+    prior_sum = sum(recent_rsi_list[-(n_days - 1):])
+    req_1d_rsi = (n_days * target_avg_rsi) - prior_sum
+
+    if req_1d_rsi <= 0.1:
+        # Will exceed threshold even on a sharp drop; compute floor price where 1D RSI = 0.5
+        return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], 0.5)
+    elif req_1d_rsi >= 99.9:
+        # Cannot reach target N-day average in a single bar even with a massive rally
+        return np.nan
+    else:
+        return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], req_1d_rsi)
+
+def compute_ticker_snapshot_row(raw_df, sym, active_rsi_days=2, custom_exit_rsi_days=2, custom_exit_thresh=70):
+    """
+    Computes a single row containing current RSI readings and all Exit Target Prices ($)
+    for the Universe Monitor and Watchlist tables.
+    """
+    df = normalize_ohlcv_df(raw_df)
+    if len(df) < 205:
+        return None
+
+    if 'Adj Close' in df.columns and 'Close' in df.columns:
+        close_s = df['Adj Close']
+    else:
+        close_s = df['Close']
+
+    rsi_s, avg_gain_s, avg_loss_s = calculate_wilders_rsi_with_state(close_s, period=2)
+    rsi_2d = rsi_s.rolling(2).mean()
+    rsi_3d = rsi_s.rolling(3).mean()
+    rsi_5d = rsi_s.rolling(5).mean()
+
+    sma5 = close_s.rolling(5).mean()
+    sma200 = close_s.rolling(200).mean()
+
+    hc3 = close_s.rolling(3).max()
+    hc5 = close_s.rolling(5).max()
+    hc7 = close_s.rolling(7).max()
+    hc10 = close_s.rolling(10).max()
+
+    last_c = float(close_s.iloc[-1])
+    prev_c = float(close_s.iloc[-2])
+    c_5d_ago = float(close_s.iloc[-6]) if len(close_s) >= 6 else prev_c
+
+    chg_1d = (last_c - prev_c) / prev_c * 100.0
+    chg_5d = (last_c - c_5d_ago) / c_5d_ago * 100.0
+
+    r1 = float(rsi_s.iloc[-1])
+    r2 = float(rsi_2d.iloc[-1])
+    r3 = float(rsi_3d.iloc[-1])
+    r5 = float(rsi_5d.iloc[-1])
+
+    active_r = {1: r1, 2: r2, 3: r3, 5: r5}.get(active_rsi_days, r2)
+    bins = [-0.001, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100.001]
+    bucket_str = str(pd.cut([active_r], bins=bins, labels=BUCKET_LABELS)[0])
+
+    cur_sma5 = float(sma5.iloc[-1])
+    # Exact close needed tomorrow so Close[t+1] > SMA5[t+1] is the mean of the last 4 closes
+    next_sma5_trigger = float(close_s.iloc[-4:].mean())
+    pct_to_sma5 = (cur_sma5 - last_c) / last_c * 100.0
+
+    cur_sma200 = float(sma200.iloc[-1])
+    pct_vs_200 = (last_c - cur_sma200) / cur_sma200 * 100.0 if cur_sma200 > 0 else np.nan
+
+    ag_last = float(avg_gain_s.iloc[-1])
+    al_last = float(avg_loss_s.iloc[-1])
+    recent_r_list = [float(x) for x in rsi_s.iloc[-5:].values]
+
+    px_rsi1_50 = solve_next_close_for_rsi2(last_c, ag_last, al_last, r1, 50.0)
+    px_rsi1_70 = solve_next_close_for_rsi2(last_c, ag_last, al_last, r1, 70.0)
+    px_rsi1_80 = solve_next_close_for_rsi2(last_c, ag_last, al_last, r1, 80.0)
+    px_rsi1_90 = solve_next_close_for_rsi2(last_c, ag_last, al_last, r1, 90.0)
+
+    px_custom_rsi = solve_next_close_for_nday_rsi2(
+        last_c, ag_last, al_last, recent_r_list, custom_exit_rsi_days, float(custom_exit_thresh)
+    )
+
+    custom_col_name = f"Exit: {custom_exit_rsi_days}D RSI>{custom_exit_thresh} ($)"
+
+    return {
+        "Ticker": sym,
+        "Last Close ($)": round(last_c, 2),
+        "1D Chg (%)": round(chg_1d, 2),
+        "5D Chg (%)": round(chg_5d, 2),
+        "1D RSI(2)": round(r1, 1),
+        "2D RSI(2)": round(r2, 1),
+        "3D RSI(2)": round(r3, 1),
+        "5D RSI(2)": round(r5, 1),
+        "Bucket": bucket_str,
+        "Exit: 5D SMA ($)": round(cur_sma5, 2),
+        "Next Close > SMA5 ($)": round(next_sma5_trigger, 2),
+        "% to 5D SMA": round(pct_to_sma5, 2),
+        "Exit: 3D High ($)": round(float(hc3.iloc[-1]), 2),
+        "Exit: 5D High ($)": round(float(hc5.iloc[-1]), 2),
+        "Exit: 7D High ($)": round(float(hc7.iloc[-1]), 2),
+        "Exit: 10D High ($)": round(float(hc10.iloc[-1]), 2),
+        "Exit: 1D RSI>50 ($)": round(px_rsi1_50, 2) if pd.notna(px_rsi1_50) else np.nan,
+        "Exit: 1D RSI>70 ($)": round(px_rsi1_70, 2) if pd.notna(px_rsi1_70) else np.nan,
+        "Exit: 1D RSI>80 ($)": round(px_rsi1_80, 2) if pd.notna(px_rsi1_80) else np.nan,
+        "Exit: 1D RSI>90 ($)": round(px_rsi1_90, 2) if pd.notna(px_rsi1_90) else np.nan,
+        custom_col_name: round(px_custom_rsi, 2) if pd.notna(px_custom_rsi) else np.nan,
+        "200D SMA ($)": round(cur_sma200, 2),
+        "% vs 200 SMA": round(pct_vs_200, 2) if pd.notna(pct_vs_200) else np.nan
+    }
+
+def get_snapshot_column_config(custom_col_name):
+    """Returns strict numeric column configuration so every column sorts properly."""
+    return {
+        "Ticker": st.column_config.TextColumn("Ticker", pinned=True, width="small"),
+        "Last Close ($)": st.column_config.NumberColumn("Last Close ($)", format="$%.2f"),
+        "1D Chg (%)": st.column_config.NumberColumn("1D Chg (%)", format="%+.2f%%"),
+        "5D Chg (%)": st.column_config.NumberColumn("5D Chg (%)", format="%+.2f%%"),
+        "1D RSI(2)": st.column_config.NumberColumn("1D RSI(2)", format="%.1f"),
+        "2D RSI(2)": st.column_config.NumberColumn("2D RSI(2)", format="%.1f"),
+        "3D RSI(2)": st.column_config.NumberColumn("3D RSI(2)", format="%.1f"),
+        "5D RSI(2)": st.column_config.NumberColumn("5D RSI(2)", format="%.1f"),
+        "Bucket": st.column_config.TextColumn("Bucket"),
+        "Exit: 5D SMA ($)": st.column_config.NumberColumn(
+            "Exit: 5D SMA ($)", format="$%.2f", help="Current 5-Day Simple Moving Average."
+        ),
+        "Next Close > SMA5 ($)": st.column_config.NumberColumn(
+            "Next Close > SMA5 ($)", format="$%.2f",
+            help="Exact Close price needed tomorrow so tomorrow's Close finishes above tomorrow's 5-Day SMA."
+        ),
+        "% to 5D SMA": st.column_config.NumberColumn(
+            "% to 5D SMA", format="%+.2f%%", help="Percentage move from Last Close to current 5D SMA."
+        ),
+        "Exit: 3D High ($)": st.column_config.NumberColumn("Exit: 3D High ($)", format="$%.2f"),
+        "Exit: 5D High ($)": st.column_config.NumberColumn("Exit: 5D High ($)", format="$%.2f"),
+        "Exit: 7D High ($)": st.column_config.NumberColumn("Exit: 7D High ($)", format="$%.2f"),
+        "Exit: 10D High ($)": st.column_config.NumberColumn("Exit: 10D High ($)", format="$%.2f"),
+        "Exit: 1D RSI>50 ($)": st.column_config.NumberColumn(
+            "Exit: 1D RSI>50 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 50."
+        ),
+        "Exit: 1D RSI>70 ($)": st.column_config.NumberColumn(
+            "Exit: 1D RSI>70 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 70."
+        ),
+        "Exit: 1D RSI>80 ($)": st.column_config.NumberColumn(
+            "Exit: 1D RSI>80 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 80."
+        ),
+        "Exit: 1D RSI>90 ($)": st.column_config.NumberColumn(
+            "Exit: 1D RSI>90 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 90."
+        ),
+        custom_col_name: st.column_config.NumberColumn(
+            custom_col_name, format="$%.2f",
+            help="Next Close price required for the selected N-Day RSI(2) to cross the target threshold (NaN if unreachable in 1 session)."
+        ),
+        "200D SMA ($)": st.column_config.NumberColumn("200D SMA ($)", format="$%.2f"),
+        "% vs 200 SMA": st.column_config.NumberColumn("% vs 200 SMA", format="%+.2f%%")
+    }
 
 def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     """
@@ -258,12 +447,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
 # ==========================================
 
 def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
-    """
-    Creates a 3-row synchronized Plotly chart:
-      Row 1: Daily Candlestick Price Action + 5-Day SMA & 200-Day SMA
-      Row 2: 2-Day RSI(2) with horizontal lines at 10, 20, 80, 90
-      Row 3: 5-Day RSI(2) with horizontal lines at 10, 20, 80, 90
-    """
     plot_df = df.iloc[-lookback_bars:].copy() if lookback_bars and len(df) > lookback_bars else df.copy()
 
     fig = make_subplots(
@@ -279,7 +462,6 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
         )
     )
 
-    # --- ROW 1: Daily Candlesticks & Moving Averages ---
     fig.add_trace(
         go.Candlestick(
             x=plot_df.index,
@@ -316,7 +498,6 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
         row=1, col=1
     )
 
-    # --- ROW 2: 2-Day RSI(2) ---
     fig.add_trace(
         go.Scatter(
             x=plot_df.index,
@@ -328,7 +509,6 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
         row=2, col=1
     )
 
-    # --- ROW 3: 5-Day RSI(2) ---
     fig.add_trace(
         go.Scatter(
             x=plot_df.index,
@@ -340,22 +520,20 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
         row=3, col=1
     )
 
-    # Add Horizontal Lines at 10, 20, 80, 90 to both RSI subplots (Rows 2 and 3)
     threshold_styles = [
-        (90, "#FF1744", "solid", "90"),
-        (80, "#FF9100", "dash",  "80"),
-        (20, "#00E5FF", "dash",  "20"),
-        (10, "#00E676", "solid", "10"),
+        (90, "#FF1744", "solid"),
+        (80, "#FF9100", "dash"),
+        (20, "#00E5FF", "dash"),
+        (10, "#00E676", "solid"),
     ]
 
     for r_idx in [2, 3]:
-        # Shaded Overbought (80-90+) and Oversold (10-20) bands for instant visual clarity
         fig.add_hrect(y0=80, y1=90, fillcolor="#FF5252", opacity=0.08, line_width=0, row=r_idx, col=1)
         fig.add_hrect(y0=90, y1=100, fillcolor="#FF1744", opacity=0.14, line_width=0, row=r_idx, col=1)
         fig.add_hrect(y0=10, y1=20, fillcolor="#00E5FF", opacity=0.08, line_width=0, row=r_idx, col=1)
         fig.add_hrect(y0=0,  y1=10, fillcolor="#00E676", opacity=0.14, line_width=0, row=r_idx, col=1)
 
-        for lvl, color, dash_style, label_txt in threshold_styles:
+        for lvl, color, dash_style in threshold_styles:
             fig.add_hline(
                 y=lvl,
                 line_dash=dash_style,
@@ -374,8 +552,6 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
         )
 
     fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-
-    # Hide weekend gaps and disable the bottom candlestick range slider
     fig.update_xaxes(
         rangebreaks=[dict(bounds=["sat", "mon"])],
         rangeslider_visible=False
@@ -396,7 +572,6 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
 # ==========================================
 
 def filter_signal_rows(df, require_uptrend=True, fresh_only=False):
-    """Applies trend and fresh-entry filters to valid signal rows."""
     data = df.dropna(subset=['Bucket']).copy()
     if require_uptrend:
         data = data[data['Above_200SMA'] == True]
@@ -405,7 +580,6 @@ def filter_signal_rows(df, require_uptrend=True, fresh_only=False):
     return data
 
 def summarize_series(ret_s, days_s, mae_s):
-    """Computes clean summary statistics for a return series."""
     valid = ret_s.dropna()
     n = len(valid)
     if n == 0:
@@ -420,7 +594,6 @@ def summarize_series(ret_s, days_s, mae_s):
     return int(n), round(wr, 1), round(avg_ret, 2), pf, round(avg_days, 1), round(avg_mae, 2)
 
 def build_bucket_table(filtered_df, exit_key):
-    """Table 1: Performance across all 10 Entry Buckets for a single selected Exit Rule."""
     rows = []
     for b in BUCKET_LABELS:
         sub = filtered_df[filtered_df['Bucket'] == b]
@@ -439,7 +612,6 @@ def build_bucket_table(filtered_df, exit_key):
     return pd.DataFrame(rows).set_index("Entry Bucket")
 
 def build_exit_comparison_table(filtered_df, selected_buckets, exit_label_map):
-    """Table 2: Compares all Exit Rules as rows for the selected Entry Bucket(s)."""
     sub = filtered_df[filtered_df['Bucket'].astype(str).isin(selected_buckets)]
     rows = []
     for k in EXIT_KEYS:
@@ -458,7 +630,6 @@ def build_exit_comparison_table(filtered_df, selected_buckets, exit_label_map):
     return pd.DataFrame(rows).set_index("Exit Strategy (Next Open)")
 
 def build_entry_exit_matrix(filtered_df, metric_choice, exit_label_map):
-    """Builds a clean 2D matrix (Rows = Entry Buckets, Columns = Exit Rules) for a single chosen metric."""
     rows = []
     for b in BUCKET_LABELS:
         sub = filtered_df[filtered_df['Bucket'] == b]
@@ -482,7 +653,6 @@ def build_entry_exit_matrix(filtered_df, metric_choice, exit_label_map):
     return pd.DataFrame(rows).set_index("Entry Bucket")
 
 def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
-    """Builds Year-by-Year table and individual trade audit log with exact Next-Open dates/prices."""
     sub = filtered_df[filtered_df['Bucket'].astype(str).isin(selected_buckets)].dropna(subset=[f'Ret_{exit_key}']).copy()
     if sub.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -574,7 +744,6 @@ def run_portfolio_backtest_next_open(
         d = all_dates[idx]
         prev_d = all_dates[idx - 1]
 
-        # Step A: Process Exits at Today's Open (d) based on Yesterday's Close (prev_d)
         closed_tickers = []
         for ticker, pos in open_positions.items():
             df = prepared_dfs[ticker]
@@ -630,7 +799,6 @@ def run_portfolio_backtest_next_open(
         for t in closed_tickers:
             del open_positions[t]
 
-        # Step B: Identify Entry Signals from prev_d Close -> Enter at Today's Open (d)
         available_slots = max_positions - len(open_positions)
         candidates = []
 
@@ -685,7 +853,6 @@ def run_portfolio_backtest_next_open(
                         'days_held': 0
                     }
 
-        # Step C: Mark-to-Market Portfolio Equity at Close of Day d
         eod_equity = cash
         for t_open, p_open in open_positions.items():
             df_o = prepared_dfs[t_open]
@@ -810,14 +977,32 @@ def fetch_daily_data(symbol, start, end):
     df = normalize_ohlcv_df(raw)
     return df if not df.empty else None
 
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_bulk_recent_data(tickers_tuple, days_back=420):
+    """Cached bulk downloader for fast Universe & Watchlist snapshot generation."""
+    tickers_list = list(tickers_tuple)
+    if not tickers_list:
+        return pd.DataFrame()
+    s_d = (datetime.now() - timedelta(days=days_back)).strftime('%Y-%m-%d')
+    e_d = datetime.now().strftime('%Y-%m-%d')
+    return yf.download(
+        tickers_list,
+        start=s_d,
+        end=e_d,
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True
+    )
+
 # ==========================================
 # 5. INTERFACE TABS (4 SEPARATE TABS)
 # ==========================================
 
-tab_study, tab_watchlist, tab_screener, tab_portfolio = st.tabs([
+tab_study, tab_screener, tab_watchlist, tab_portfolio = st.tabs([
     "📊 Single Ticker Study (Next-Open)",
-    "📋 Custom Watchlist Analyzer",
-    "🔎 Live Universe Screener",
+    "🌐 Universe Monitor & Exit Prices",
+    "📋 Custom Watchlist & Exit Prices",
     "📁 Multi-Stock Portfolio Backtester"
 ])
 
@@ -1099,275 +1284,196 @@ with tab_study:
                 st.dataframe(trades_df.sort_values(by="Signal Date (Close)", ascending=False), use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 2: CUSTOM WATCHLIST ANALYZER
+# TAB 2: UNIVERSE MONITOR & EXIT PRICES (ALL TICKERS)
 # ----------------------------------------------------
-with tab_watchlist:
-    st.subheader("Custom Watchlist Analyzer (Next-Open Execution)")
+with tab_screener:
+    st.subheader("🌐 Full Universe Monitor — Current RSI Readings & Target Exit Prices")
     st.caption(
-        "Enter one or more tickers to inspect their current RSI(2) bucket and historical Next-Open edge whenever they entered that exact bucket."
+        "Select any universe from the dropdown to list ALL constituent tickers, their live 1D/2D/3D/5D RSI(2) readings, "
+        "and exact target exit prices ($). Click any column header in the table to sort ascending or descending."
     )
 
-    w_c1, w_c2, w_c3, w_c4 = st.columns([2.0, 1.1, 1.4, 0.8])
+    u_c1, u_c2, u_c3, u_c4, u_c5 = st.columns([1.3, 1.1, 1.1, 1.1, 1.2])
+    with u_c1:
+        mon_universe = st.selectbox(
+            "1. Select Universe",
+            ["Major ETFs", "Dow Jones 30", "Nasdaq 100", "Russell 2000 (Small Caps)", "S&P 500"],
+            index=1,
+            key="mon_univ_select"
+        )
+    with u_c2:
+        mon_bucket_rsi = st.selectbox(
+            "Bucket RSI Lookback",
+            ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
+            index=0,
+            key="mon_b_rsi"
+        )
+        mon_b_days = RSI_DAYS_MAP[mon_bucket_rsi]
+    with u_c3:
+        mon_custom_exit_days = st.selectbox(
+            "Custom Exit RSI Lookback",
+            [1, 2, 3, 5],
+            index=1,
+            format_func=lambda x: f"{x}-Day RSI(2)",
+            key="mon_cx_days"
+        )
+    with u_c4:
+        mon_custom_exit_thresh = st.selectbox(
+            "Custom Exit RSI Threshold",
+            RSI_THRESHOLDS,
+            index=6,  # Default > 70
+            format_func=lambda x: f"RSI > {x}",
+            key="mon_cx_thresh"
+        )
+    with u_c5:
+        mon_search = st.text_input("Quick Filter Ticker (Optional)", value="", placeholder="e.g. AAPL, NVDA", key="mon_search")
+
+    u_tickers = get_universe_tickers(mon_universe)
+
+    with st.spinner(f"Loading live RSI & Exit Price snapshot for all {len(u_tickers)} tickers in {mon_universe}..."):
+        bulk_univ_df = fetch_bulk_recent_data(tuple(u_tickers), days_back=420)
+
+        univ_rows = []
+        for sym in u_tickers:
+            d_sym = extract_symbol_daily(bulk_univ_df, sym, len(u_tickers))
+            if d_sym.empty:
+                continue
+            row_data = compute_ticker_snapshot_row(
+                d_sym,
+                sym,
+                active_rsi_days=mon_b_days,
+                custom_exit_rsi_days=mon_custom_exit_days,
+                custom_exit_thresh=mon_custom_exit_thresh
+            )
+            if row_data is not None:
+                univ_rows.append(row_data)
+
+    if not univ_rows:
+        st.error(f"Could not load market data for {mon_universe}.")
+    else:
+        full_univ_df = pd.DataFrame(univ_rows)
+        custom_col_label = f"Exit: {mon_custom_exit_days}D RSI>{mon_custom_exit_thresh} ($)"
+
+        # Optional Quick-Sort & Filter Bar
+        sort_c1, sort_c2, sort_c3 = st.columns([1.6, 1.0, 1.8])
+        with sort_c1:
+            default_sort_col = st.selectbox(
+                "Sort Universe By Column (or click any column header below):",
+                options=list(full_univ_df.columns),
+                index=list(full_univ_df.columns).index(f"{mon_b_days}D RSI(2)"),
+                key="mon_sort_col"
+            )
+        with sort_c2:
+            sort_dir = st.radio("Sort Order", ["Ascending (Low → High)", "Descending (High → Low)"], horizontal=True, key="mon_sort_dir")
+        with sort_c3:
+            trend_filter_mode = st.radio(
+                "Display Scope",
+                ["All Tickers in Universe", "Only Above 200D SMA", "Only Oversold (<20 RSI)"],
+                horizontal=True,
+                key="mon_scope_mode"
+            )
+
+        display_univ_df = full_univ_df.copy()
+
+        if mon_search.strip():
+            q_tokens = [t.strip().upper() for t in re.split(r'[, \n]+', mon_search) if t.strip()]
+            display_univ_df = display_univ_df[display_univ_df["Ticker"].isin(q_tokens)]
+
+        if trend_filter_mode == "Only Above 200D SMA":
+            display_univ_df = display_univ_df[display_univ_df["% vs 200 SMA"] > 0]
+        elif trend_filter_mode == "Only Oversold (<20 RSI)":
+            display_univ_df = display_univ_df[display_univ_df[f"{mon_b_days}D RSI(2)"] <= 20.0]
+
+        asc_bool = ("Ascending" in sort_dir)
+        display_univ_df = display_univ_df.sort_values(by=default_sort_col, ascending=asc_bool, na_position='last').reset_index(drop=True)
+
+        # Summary Metrics Banner
+        s_m1, s_m2, s_m3, s_m4 = st.columns(4)
+        s_m1.metric("Tickers Listed", f"{len(display_univ_df)} / {len(full_univ_df)}")
+        s_m2.metric("Oversold (2D RSI ≤ 20)", f"{int((full_univ_df['2D RSI(2)'] <= 20).sum())}")
+        s_m3.metric("Oversold (5D RSI ≤ 20)", f"{int((full_univ_df['5D RSI(2)'] <= 20).sum())}")
+        s_m4.metric("Above 200-Day SMA", f"{(full_univ_df['% vs 200 SMA'] > 0).mean() * 100:.1f}%")
+
+        st.dataframe(
+            display_univ_df,
+            column_config=get_snapshot_column_config(custom_col_label),
+            hide_index=True,
+            use_container_width=True,
+            height=620
+        )
+
+        st.download_button(
+            label=f"📥 Download {mon_universe} RSI & Exit Price Table (CSV)",
+            data=display_univ_df.to_csv(index=False).encode('utf-8'),
+            file_name=f"{mon_universe.lower().replace(' ', '_')}_exit_prices.csv",
+            mime="text/csv"
+        )
+
+# ----------------------------------------------------
+# TAB 3: CUSTOM WATCHLIST & EXIT PRICES
+# ----------------------------------------------------
+with tab_watchlist:
+    st.subheader("📋 Custom Watchlist — Current RSI Readings & Target Exit Prices")
+    st.caption(
+        "Enter your personal list of tickers to view their current 1D/2D/3D/5D RSI(2) readings and all exact target exit prices ($). "
+        "Every column is sortable by clicking its header."
+    )
+
+    w_c1, w_c2, w_c3, w_c4 = st.columns([2.2, 1.0, 1.0, 1.0])
     with w_c1:
         w_input = st.text_input(
             "Watchlist Tickers (comma or space separated)",
-            value="SPY, QQQ, IWM, META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA",
+            value="SPY, QQQ, IWM, DIA, META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AMD",
             key="w_tickers_input"
         )
     with w_c2:
-        w_rsi_choice = st.selectbox("RSI(2) Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=2, key="w_rsi")
-        w_rsi_days = RSI_DAYS_MAP[w_rsi_choice]
-        w_exit_map = get_exit_label_map(w_rsi_choice)
-        w_inv_exit_map = {v: k for k, v in w_exit_map.items()}
+        w_bucket_rsi = st.selectbox("Bucket RSI Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=0, key="w_b_rsi")
+        w_b_days = RSI_DAYS_MAP[w_bucket_rsi]
     with w_c3:
-        w_exit_label = st.selectbox("Benchmark Exit (Next Open)", list(w_exit_map.values()), index=0, key="w_exit")
-        w_exit_key = w_inv_exit_map[w_exit_label]
+        w_cx_days = st.selectbox("Custom Exit RSI", [1, 2, 3, 5], index=1, format_func=lambda x: f"{x}-Day RSI(2)", key="w_cx_days")
     with w_c4:
-        w_years = st.number_input("History (Yrs)", min_value=2, max_value=25, value=10, key="w_yrs")
+        w_cx_thresh = st.selectbox("Custom Exit Threshold", RSI_THRESHOLDS, index=6, format_func=lambda x: f"RSI > {x}", key="w_cx_thresh")
 
-    w_f1, w_f2 = st.columns(2)
-    with w_f1:
-        w_uptrend = st.checkbox("Require Historical Signals to be Above 200-Day SMA", value=True, key="w_trend")
-    with w_f2:
-        w_fresh = st.checkbox("First Day Entering Bucket Only (No Overlap)", value=False, key="w_fresh")
+    w_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', w_input) if s.strip()]))
 
-    if st.button("Analyze Custom Watchlist", type="primary", use_container_width=True):
-        w_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', w_input) if s.strip()]))
-        if not w_list:
-            st.warning("Please enter at least one valid ticker symbol.")
+    if not w_list:
+        st.warning("Please enter at least one valid ticker symbol.")
+    else:
+        with st.spinner(f"Loading RSI readings and Exit Target Prices for {len(w_list)} watchlist ticker(s)..."):
+            bulk_w_df = fetch_bulk_recent_data(tuple(w_list), days_back=420)
+            w_rows = []
+            for sym in w_list:
+                d_sym = extract_symbol_daily(bulk_w_df, sym, len(w_list))
+                if d_sym.empty:
+                    continue
+                row_data = compute_ticker_snapshot_row(
+                    d_sym,
+                    sym,
+                    active_rsi_days=w_b_days,
+                    custom_exit_rsi_days=w_cx_days,
+                    custom_exit_thresh=w_cx_thresh
+                )
+                if row_data is not None:
+                    w_rows.append(row_data)
+
+        if not w_rows:
+            st.error("Could not retrieve sufficient trading history for the entered ticker(s).")
         else:
-            with st.spinner(f"Analyzing {len(w_list)} watchlist ticker(s)..."):
-                s_w = (datetime.now() - timedelta(days=w_years * 365)).strftime('%Y-%m-%d')
-                e_w = datetime.now().strftime('%Y-%m-%d')
-                bulk_w = yf.download(w_list, start=s_w, end=e_w, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+            watch_df = pd.DataFrame(w_rows)
+            w_custom_col = f"Exit: {w_cx_days}D RSI>{w_cx_thresh} ($)"
+            watch_df = watch_df.sort_values(by=f"{w_b_days}D RSI(2)", ascending=True).reset_index(drop=True)
 
-                rows = []
-                for sym in w_list:
-                    d_sym = extract_symbol_daily(bulk_w, sym, len(w_list))
-                    if len(d_sym) < 220:
-                        continue
-                    p_df = prepare_stock_data(d_sym, rsi_days=w_rsi_days)
-                    if p_df.empty:
-                        continue
-
-                    last = p_df.iloc[-1]
-                    c_b = str(last['Bucket'])
-
-                    hist = filter_signal_rows(p_df, require_uptrend=w_uptrend, fresh_only=w_fresh)
-                    sub_b = hist[hist['Bucket'] == c_b]
-                    n, wr, avg_r, pf, days, mae = summarize_series(
-                        sub_b[f'Ret_{w_exit_key}'], sub_b[f'Days_{w_exit_key}'], sub_b[f'MAE_{w_exit_key}']
-                    )
-
-                    rows.append({
-                        "Ticker": sym,
-                        "Last Close": round(last['Close_Adj'], 2),
-                        "1D RSI(2)": round(last['RSI2_1d'], 1),
-                        "2D RSI(2)": round(last['RSI2_2d'], 1),
-                        "3D RSI(2)": round(last['RSI2_3d'], 1),
-                        "5D RSI(2)": round(last['RSI2_5d'], 1),
-                        f"Current Bucket ({w_rsi_choice})": c_b,
-                        "> 200 SMA": "Yes" if bool(last['Above_200SMA']) else "No",
-                        "Prior 5D (%)": round(last['Prior_5d'], 2),
-                        "Hist Trades (in Bucket)": n,
-                        "Hist Win Rate (%)": wr,
-                        "Hist Avg Ret (%)": avg_r,
-                        "Hist Profit Factor": pf,
-                        "Hist Avg Hold (Days)": days,
-                        "Hist Avg Drawdown (%)": mae
-                    })
-
-                if not rows:
-                    st.error("Could not retrieve sufficient trading history (minimum 220 days) for the entered ticker(s).")
-                else:
-                    scan_df = pd.DataFrame(rows).sort_values(by=f"{w_rsi_days}D RSI(2)", ascending=True)
-                    w_col_cfg = {
-                        "Last Close": st.column_config.NumberColumn(format="$%.2f"),
-                        "1D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                        "2D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                        "3D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                        "5D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                        "Prior 5D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                        "Hist Trades (in Bucket)": st.column_config.NumberColumn(format="%d"),
-                        "Hist Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-                        "Hist Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                        "Hist Profit Factor": st.column_config.NumberColumn(format="%.2f"),
-                        "Hist Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
-                        "Hist Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%")
-                    }
-                    st.dataframe(scan_df, column_config=w_col_cfg, use_container_width=True)
-                    st.download_button(
-                        label="Download Watchlist Results (CSV)",
-                        data=scan_df.to_csv(index=False).encode('utf-8'),
-                        file_name="watchlist_next_open_results.csv",
-                        mime="text/csv"
-                    )
-
-# ----------------------------------------------------
-# TAB 3: LIVE UNIVERSE SCREENER
-# ----------------------------------------------------
-with tab_screener:
-    st.subheader("Live Index Universe Screener (Next-Open Execution)")
-    st.caption(
-        "Scans an entire index universe for stocks currently sitting in your target RSI(2) entry buckets as of the latest Close."
-    )
-
-    s_c1, s_c2, s_c3, s_c4 = st.columns([1.2, 1.1, 1.4, 1.4])
-    with s_c1:
-        scr_universe = st.selectbox(
-            "Select Index Universe",
-            ["Major ETFs", "Dow Jones 30", "Nasdaq 100", "S&P 500", "Russell 2000 (Small Caps)"],
-            index=2,
-            key="scr_univ"
-        )
-    with s_c2:
-        scr_rsi_choice = st.selectbox(
-            "RSI(2) Lookback",
-            ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
-            index=2,
-            key="scr_rsi"
-        )
-        scr_rsi_days = RSI_DAYS_MAP[scr_rsi_choice]
-        scr_exit_map = get_exit_label_map(scr_rsi_choice)
-        scr_inv_exit_map = {v: k for k, v in scr_exit_map.items()}
-    with s_c3:
-        scr_buckets = st.multiselect(
-            "Filter Active Entry Buckets",
-            options=BUCKET_LABELS,
-            default=['<10', '11-20'],
-            key="scr_buckets"
-        )
-    with s_c4:
-        scr_exit_label = st.selectbox(
-            "Benchmark Exit (Next Open)",
-            list(scr_exit_map.values()),
-            index=0,
-            key="scr_exit"
-        )
-        scr_exit_key = scr_inv_exit_map[scr_exit_label]
-
-    s_f1, s_f2, s_f3 = st.columns([1.4, 1.4, 1.0])
-    with s_f1:
-        scr_uptrend_gate = st.checkbox(
-            "Enforce Close > 200-Day SMA Gate (Today & Historical)",
-            value=True,
-            key="scr_trend"
-        )
-    with s_f2:
-        scr_fresh_gate = st.checkbox(
-            "Only Show Fresh Entries Today (Just Entered Bucket on Latest Close)",
-            value=False,
-            key="scr_fresh"
-        )
-    with s_f3:
-        scr_years = st.number_input("Historical Backtest Depth (Yrs)", min_value=2, max_value=15, value=5, key="scr_yrs")
-
-    if st.button("🔎 Run Live Universe Screen", type="primary", use_container_width=True):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        status_text.text("Checking S&P 500 (SPY) broad market regime...")
-        spy_df = fetch_daily_data(
-            "SPY",
-            (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
-            datetime.now().strftime('%Y-%m-%d')
-        )
-        spy_rsi5 = np.nan
-        if spy_df is not None and len(spy_df) >= 200:
-            spy_prep = prepare_stock_data(spy_df, rsi_days=5)
-            spy_rsi5 = spy_prep['RSI2_5d'].iloc[-1]
-
-        progress_bar.progress(15)
-        status_text.text(f"Loading constituent list for {scr_universe}...")
-        u_tickers = get_universe_tickers(scr_universe)
-
-        progress_bar.progress(30)
-        status_text.text(f"Downloading historical daily data for {len(u_tickers)} tickers...")
-        s_sc = (datetime.now() - timedelta(days=scr_years * 365)).strftime('%Y-%m-%d')
-        e_sc = datetime.now().strftime('%Y-%m-%d')
-        bulk_sc = yf.download(u_tickers, start=s_sc, end=e_sc, group_by="ticker", auto_adjust=False, progress=False, threads=True)
-
-        progress_bar.progress(75)
-        status_text.text("Filtering active setups and computing Next-Open historical expectancy...")
-
-        screen_rows = []
-        for sym in u_tickers:
-            d_sym = extract_symbol_daily(bulk_sc, sym, len(u_tickers))
-            if len(d_sym) < 220:
-                continue
-            p_df = prepare_stock_data(d_sym, rsi_days=scr_rsi_days)
-            if p_df.empty:
-                continue
-
-            last = p_df.iloc[-1]
-            prev = p_df.iloc[-2]
-            c_b = str(last['Bucket'])
-            is_bull = bool(last['Above_200SMA'])
-
-            if scr_uptrend_gate and not is_bull:
-                continue
-            if scr_buckets and c_b not in scr_buckets:
-                continue
-            if scr_fresh_gate and str(prev['Bucket']) == c_b:
-                continue
-
-            hist = filter_signal_rows(p_df, require_uptrend=scr_uptrend_gate, fresh_only=scr_fresh_gate)
-            sub_b = hist[hist['Bucket'] == c_b]
-            n, wr, avg_r, pf, days, mae = summarize_series(
-                sub_b[f'Ret_{scr_exit_key}'], sub_b[f'Days_{scr_exit_key}'], sub_b[f'MAE_{scr_exit_key}']
+            st.dataframe(
+                watch_df,
+                column_config=get_snapshot_column_config(w_custom_col),
+                hide_index=True,
+                use_container_width=True,
+                height=480
             )
-
-            screen_rows.append({
-                "Ticker": sym,
-                "Last Close": round(last['Close_Adj'], 2),
-                "1D RSI(2)": round(last['RSI2_1d'], 1),
-                "2D RSI(2)": round(last['RSI2_2d'], 1),
-                "3D RSI(2)": round(last['RSI2_3d'], 1),
-                "5D RSI(2)": round(last['RSI2_5d'], 1),
-                f"Active Bucket ({scr_rsi_choice})": c_b,
-                "> 200 SMA": "Yes" if is_bull else "No",
-                "Prior 5D (%)": round(last['Prior_5d'], 2),
-                "Hist Trades": n,
-                "Hist Win Rate (%)": wr,
-                "Hist Avg Ret (%)": avg_r,
-                "Hist Profit Factor": pf,
-                "Hist Avg Hold (Days)": days,
-                "Hist Avg Drawdown (%)": mae
-            })
-
-        progress_bar.progress(100)
-        status_text.empty()
-
-        if pd.notna(spy_rsi5):
-            if spy_rsi5 <= 25:
-                st.success(f"**Macro Context**: Systemic Oversold Flush (SPY 5-Day RSI(2) = {spy_rsi5:.1f}). Broad market mean-reversion tailwinds active.")
-            else:
-                st.info(f"**Macro Context**: Neutral / Bullish Market Breadth (SPY 5-Day RSI(2) = {spy_rsi5:.1f}). Pullbacks are stock-specific.")
-
-        if not screen_rows:
-            st.info(f"No stocks in **{scr_universe}** currently match the selected bucket and trend filters.")
-        else:
-            st.subheader(f"Filtered Setups Found: {len(screen_rows)} Tickers")
-            scr_df = pd.DataFrame(screen_rows).sort_values(by=f"{scr_rsi_days}D RSI(2)", ascending=True)
-            scr_col_cfg = {
-                "Last Close": st.column_config.NumberColumn(format="$%.2f"),
-                "1D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                "2D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                "3D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                "5D RSI(2)": st.column_config.NumberColumn(format="%.1f"),
-                "Prior 5D (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "Hist Trades": st.column_config.NumberColumn(format="%d"),
-                "Hist Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
-                "Hist Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
-                "Hist Profit Factor": st.column_config.NumberColumn(format="%.2f"),
-                "Hist Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
-                "Hist Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%")
-            }
-            st.dataframe(scr_df, column_config=scr_col_cfg, use_container_width=True)
             st.download_button(
-                label="Download Screener Matches (CSV)",
-                data=scr_df.to_csv(index=False).encode('utf-8'),
-                file_name=f"screener_{scr_universe.lower().replace(' ', '_')}.csv",
+                label="📥 Download Watchlist Exit Prices (CSV)",
+                data=watch_df.to_csv(index=False).encode('utf-8'),
+                file_name="watchlist_exit_prices.csv",
                 mime="text/csv"
             )
 
