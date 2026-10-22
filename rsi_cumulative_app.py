@@ -9,17 +9,23 @@ import requests
 import io
 import re
 
-st.set_page_config(page_title="RSI(2) Next-Open Backtester & Exit Monitor", layout="wide")
+st.set_page_config(page_title="RSI(2) Next-Open Backtester & L/S Engine", layout="wide")
 
-st.title("RSI(2) Quantitative Backtester & Live Exit Price Monitor")
+st.title("RSI(2) Quantitative Backtester & Long/Short Basket Engine")
 st.caption(
-    "Execution Model: Entry Signal on Close → Buy Next Day Open | "
-    "Exit Signal on Close → Sell Next Day Open"
+    "Execution Model: Entry Signal on Close → Execute Next Day Open | "
+    "Exit Signal on Close → Execute Next Day Open"
 )
 
 # ==========================================
 # CONSTANTS & STRATEGY DEFINITIONS
 # ==========================================
+
+DEFAULT_LS_BASKET = [
+    "SPY", "QQQ", "GLD", "SLV", "TLT",
+    "EWZ", "FXI", "EWJ", "EWG",
+    "SOXL", "LABU", "JNUG", "GUSH"
+]
 
 BUCKET_LABELS = [
     '<10', '11-20', '21-30', '31-40', '41-50',
@@ -35,10 +41,14 @@ EXIT_KEYS = (
     + ["FIX5", "FIX10"]
 )
 
-RSI_DAYS_MAP = {"2-Day RSI(2)": 2, "3-Day RSI(2)": 3, "5-Day RSI(2)": 5}
+RSI_DAYS_MAP = {
+    "1-Day RSI(2)": 1,
+    "2-Day RSI(2)": 2,
+    "3-Day RSI(2)": 3,
+    "5-Day RSI(2)": 5
+}
 
 def get_exit_label_map(rsi_name="5-Day RSI(2)"):
-    """Returns human-readable exit labels dynamically matched to the chosen RSI lookback."""
     mapping = {
         "SMA5": "Close > 5-Day SMA",
         "HC3": "Close at 3-Day High Close",
@@ -63,24 +73,19 @@ DJIA_30_TICKERS = [
 ]
 
 MAJOR_ETFS_105 = [
-    # Broad US Indices & Style/Factors
     "SPY", "QQQ", "IWM", "DIA", "MDY", "IJH", "IJR", "VTI", "VOO", "RSP",
     "QQQM", "IVV", "SCHD", "VUG", "VTV", "VIG", "QUAL", "MTUM", "USMV", "SPLV",
     "IWF", "IWD", "IWO", "IWN", "IWP", "IWS", "ARKK", "ARKW",
-    # S&P 500 Sectors
     "XLK", "XLF", "XLV", "XLE", "XLY", "XLI", "XLP", "XLU", "XLB", "XLRE", "XLC",
-    # Sub-Sectors, Industries & Thematic
     "SMH", "SOXX", "IGV", "CIBR", "HACK", "SKYY", "BOTZ", "IBB", "XBI", "IHI",
     "XPH", "KRE", "KBE", "IAI", "KIE", "ITB", "XHB", "VNQ", "IYR", "XRT",
     "RTH", "XOP", "OIH", "AMLP", "XME", "GDX", "GDXJ", "SIL", "COPX", "URA",
     "URNM", "ITA", "XAR", "JETS", "IYT", "XTN", "TAN", "ICLN", "LIT", "PAVE", "GRID",
-    # Fixed Income / Treasury / Credit
     "TLT", "IEF", "SHY", "AGG", "BND", "LQD", "HYG", "JNK", "TIP", "EMB", "MBB",
-    # Commodities, Currencies & Crypto
     "GLD", "IAU", "SLV", "USO", "UNG", "DBC", "PDBC", "DBA", "UUP", "IBIT", "FBTC", "BITO",
-    # International & Country ETFs
     "EFA", "VEA", "EEM", "VWO", "FXI", "KWEB", "MCHI", "EWJ", "EWZ", "EWY",
-    "INDA", "EWG", "EWU", "EWC", "EWA", "EWW", "EWT", "EZU", "FEZ"
+    "INDA", "EWG", "EWU", "EWC", "EWA", "EWW", "EWT", "EZU", "FEZ",
+    "SOXL", "LABU", "JNUG", "GUSH", "TQQQ", "SPXL", "TNA", "BOIL", "KOLD"
 ]
 
 NASDAQ_100_TICKERS = [
@@ -155,10 +160,10 @@ RUSSELL_SMALLCAP_FALLBACK = [
     "ADEA", "ADMA", "ADNT", "ADUS", "AEIS", "AEO", "AESI", "AGCO", "AGYS", "AHCO",
     "AIN", "AIR", "AIT", "AKR", "AL", "ALEX", "ALG", "ALGT", "ALK", "ALKT",
     "ALRM", "ALTR", "AMBA", "AMBC", "AMED", "AMKR", "AMN", "AMPH", "AMRC", "AMRX",
-    "AMSF", "AMT", "AMWD", "ANDE", "ANF", "ANIP", "AORT", "AOSL", "APAM", "APGE",
+    "AMSF", "AMWD", "ANDE", "ANF", "ANIP", "AORT", "AOSL", "APAM", "APGE",
     "APLE", "APOG", "APPF", "APPN", "ARCB", "ARCH", "ARCT", "ARES", "ARHS", "ARKO",
     "ARLO", "ARMK", "AROC", "ARR", "ARVN", "ARWR", "ASB", "ASGN", "ASH", "ASIX",
-    "ASPN", "ASTEC", "ATEN", "ATGE", "ATI", "ATKR", "ATMU", "ATNI", "ATRC", "ATRI",
+    "ASPN", "ATEN", "ATGE", "ATI", "ATKR", "ATMU", "ATNI", "ATRC", "ATRI",
     "ATRO", "ATSG", "AVA", "AVAV", "AVNS", "AVNT", "AVO", "AVPT", "AVXL", "AWR",
     "AX", "AXGN", "AXNX", "AXSM", "AYI", "AZEK", "AZTA", "B", "BANC", "BANF",
     "BANR", "BCC", "BCML", "BCO", "BCPC", "BCRX", "BDC", "BE", "BEAM", "BECN",
@@ -180,7 +185,7 @@ RUSSELL_SMALLCAP_FALLBACK = [
     "CRUS", "CRVL", "CSGS", "CSR", "CSTE", "CSTL", "CSTM", "CSV", "CSWI", "CTBI",
     "CTKB", "CTLP", "CTO", "CTOS", "CTRE", "CTS", "CUBI", "CVBF", "CVCO", "CVCY",
     "CVGW", "CVI", "CVLG", "CVLT", "CW", "CWAN", "CWCO", "CWEN", "CWH", "CWK",
-    "CWST", "CWT", "CXM", "CXW", "CYRX", "CYTK", "DAN", "DAR", "DCOM", "orm",
+    "CWST", "CWT", "CXM", "CXW", "CYRX", "CYTK", "DAN", "DAR", "DCOM",
     "DDS", "DEA", "DEI", "DFH", "DFIN", "DGICA", "DGII", "DHC", "DHIL", "DHT",
     "DIN", "DIOD", "DJCO", "DK", "DKL", "DLB", "DLO", "DMLP", "DMRC", "DNLI",
     "DNOW", "DNUT", "DOCN", "DOCS", "DOLE", "DOMO", "TALO", "TKR", "TXG", "UMBF",
@@ -199,10 +204,6 @@ RUSSELL_SMALLCAP_FALLBACK = [
 OHLCV_NAMES = {'Open', 'High', 'Low', 'Close', 'Adj Close', 'Volume'}
 
 def normalize_ohlcv_df(df):
-    """
-    Safely flattens any yfinance DataFrame (single or multi-ticker, group_by='ticker' or 'column')
-    so that columns are guaranteed to be standard ['Open', 'High', 'Low', 'Close', ...].
-    """
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -225,7 +226,6 @@ def normalize_ohlcv_df(df):
     return df
 
 def extract_symbol_daily(bulk_data, sym, total_tickers=1):
-    """Robustly extracts single-symbol daily OHLCV from bulk or single yfinance downloads."""
     if bulk_data is None or bulk_data.empty:
         return pd.DataFrame()
     try:
@@ -248,10 +248,6 @@ def extract_symbol_daily(bulk_data, sym, total_tickers=1):
     return pd.DataFrame()
 
 def calculate_wilders_rsi_with_state(prices, period=2):
-    """
-    Calculates standard Wilder's Smoothed RSI(2) and returns avg_gain and avg_loss
-    so we can algebraically solve for exact next-bar RSI target exit prices.
-    """
     delta = prices.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -267,10 +263,399 @@ def calculate_wilders_rsi(prices, period=2):
     rsi, _, _ = calculate_wilders_rsi_with_state(prices, period=period)
     return rsi
 
+def prepare_ls_etf_data(raw_df):
+    """
+    Lightweight preparation for Long/Short Basket ETFs:
+    Computes split/dividend-adjusted Open/High/Low/Close, 1D/2D/3D/5D RSI(2), SMA(5), and SMA(200).
+    """
+    df = normalize_ohlcv_df(raw_df)
+    if df.empty or len(df) < 30:
+        return pd.DataFrame()
+
+    if 'Adj Close' in df.columns and 'Close' in df.columns:
+        adj_ratio = (df['Adj Close'] / df['Close']).replace([np.inf, -np.inf], 1.0).fillna(1.0)
+        df['Open_Adj'] = df['Open'] * adj_ratio
+        df['High_Adj'] = df['High'] * adj_ratio
+        df['Low_Adj'] = df['Low'] * adj_ratio
+        df['Close_Adj'] = df['Adj Close']
+    else:
+        df['Open_Adj'] = df['Open']
+        df['High_Adj'] = df['High']
+        df['Low_Adj'] = df['Low']
+        df['Close_Adj'] = df['Close']
+
+    close_s = df['Close_Adj']
+    df['RSI2_1d'] = calculate_wilders_rsi(close_s, period=2)
+    df['RSI2_2d'] = df['RSI2_1d'].rolling(window=2).mean()
+    df['RSI2_3d'] = df['RSI2_1d'].rolling(window=3).mean()
+    df['RSI2_5d'] = df['RSI2_1d'].rolling(window=5).mean()
+
+    df['SMA_5'] = close_s.rolling(window=5).mean()
+    df['SMA_200'] = close_s.rolling(window=200).mean()
+    return df.dropna(subset=['Open_Adj', 'Close_Adj', 'SMA_5', 'RSI2_5d'])
+
+# ==========================================
+# 2. LONG / SHORT BASKET BACKTEST ENGINE
+# ==========================================
+
+def run_long_short_basket_backtest(
+    etf_dfs,
+    rsi_days=2,
+    initial_capital=100000.0,
+    execution_mode="Independent Legs (Always Active)",
+    require_pre_exit_side=True,
+    max_long_rsi=100.0,
+    min_short_rsi=0.0,
+    max_hold_days=20
+):
+    """
+    Backtests buying the ETF with the lowest X-day RSI(2) and shorting the ETF with the highest X-day RSI(2).
+    - Signals evaluated at Yesterday's Close (prev_d) -> Executed at Today's Open (d).
+    - Long Exit: Close > SMA(5) -> Sell at Next Open.
+    - Short Exit: Close < SMA(5) -> Cover at Next Open.
+    Tracks 3 independent accounts to provide clean attribution:
+      1. Combined Long/Short Portfolio (50% Long allocation / 50% Short allocation, rebalanced on new entries)
+      2. Long-Only Leg Portfolio (100% allocation to Lowest RSI ETF)
+      3. Short-Only Leg Portfolio (100% allocation to Highest RSI ETF)
+    """
+    if not etf_dfs:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # Common trading calendar across available ETFs
+    all_dates = sorted(list(set.union(*[set(df.index) for df in etf_dfs.values()])))
+    if len(all_dates) < 10:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    rsi_col = f"RSI2_{rsi_days}d"
+
+    # Separate equity tracking for Long-Only, Short-Only, and Combined 50/50 L/S
+    long_eq = float(initial_capital)
+    short_eq = float(initial_capital)
+    comb_long_cap = float(initial_capital) * 0.5
+    comb_short_cap = float(initial_capital) * 0.5
+
+    long_pos = None   # dict: ticker, signal_date, entry_date, entry_open, days_held, leg_cap, comb_cap
+    short_pos = None  # dict: ticker, signal_date, entry_date, entry_open, days_held, leg_cap, comb_cap
+
+    trades = []
+    equity_records = []
+
+    for idx in range(1, len(all_dates)):
+        d = all_dates[idx]
+        prev_d = all_dates[idx - 1]
+
+        # --------------------------------------------------
+        # STEP A: CHECK EXITS FROM YESTERDAY'S CLOSE (prev_d) -> EXECUTE AT TODAY'S OPEN (d)
+        # --------------------------------------------------
+        if long_pos is not None:
+            t_long = long_pos['ticker']
+            df_l = etf_dfs[t_long]
+            if prev_d in df_l.index and d in df_l.index and long_pos['entry_date'] <= prev_d:
+                long_pos['days_held'] += 1
+                prev_row = df_l.loc[prev_d]
+                today_open = float(df_l.loc[d, 'Open_Adj'])
+
+                exit_long = False
+                exit_reason = ""
+                if prev_row['Close_Adj'] > prev_row['SMA_5']:
+                    exit_long = True
+                    exit_reason = "Close > SMA(5)"
+                elif max_hold_days and long_pos['days_held'] >= max_hold_days:
+                    exit_long = True
+                    exit_reason = f"Max Hold ({max_hold_days}d)"
+
+                if exit_long:
+                    ret_pct = (today_open - long_pos['entry_open']) / long_pos['entry_open'] * 100.0
+                    long_eq = long_pos['leg_cap'] * (1.0 + ret_pct / 100.0)
+                    comb_long_cap = long_pos['comb_cap'] * (1.0 + ret_pct / 100.0)
+
+                    trades.append({
+                        "Leg": "LONG",
+                        "Ticker": t_long,
+                        "Signal Date": long_pos['signal_date'].strftime('%Y-%m-%d'),
+                        "Signal RSI": round(long_pos['signal_rsi'], 1),
+                        "Entry Date (Open)": long_pos['entry_date'].strftime('%Y-%m-%d'),
+                        "Entry Open ($)": round(long_pos['entry_open'], 2),
+                        "Exit Date (Open)": d.strftime('%Y-%m-%d'),
+                        "Exit Open ($)": round(today_open, 2),
+                        "Exit Reason": exit_reason,
+                        "Return (%)": round(ret_pct, 2),
+                        "Hold (Days)": long_pos['days_held'],
+                        "Year": d.year,
+                        "Result": "Win" if ret_pct > 0 else "Loss"
+                    })
+                    long_pos = None
+
+        if short_pos is not None:
+            t_short = short_pos['ticker']
+            df_s = etf_dfs[t_short]
+            if prev_d in df_s.index and d in df_s.index and short_pos['entry_date'] <= prev_d:
+                short_pos['days_held'] += 1
+                prev_row = df_s.loc[prev_d]
+                today_open = float(df_s.loc[d, 'Open_Adj'])
+
+                exit_short = False
+                exit_reason = ""
+                if prev_row['Close_Adj'] < prev_row['SMA_5']:
+                    exit_short = True
+                    exit_reason = "Close < SMA(5)"
+                elif max_hold_days and short_pos['days_held'] >= max_hold_days:
+                    exit_short = True
+                    exit_reason = f"Max Hold ({max_hold_days}d)"
+
+                if exit_short:
+                    # Short return: profit when exit_open < entry_open; clamp loss at -100%
+                    raw_short_ret = (short_pos['entry_open'] - today_open) / short_pos['entry_open'] * 100.0
+                    ret_pct = max(-100.0, raw_short_ret)
+                    short_eq = short_pos['leg_cap'] * (1.0 + ret_pct / 100.0)
+                    comb_short_cap = short_pos['comb_cap'] * (1.0 + ret_pct / 100.0)
+
+                    trades.append({
+                        "Leg": "SHORT",
+                        "Ticker": t_short,
+                        "Signal Date": short_pos['signal_date'].strftime('%Y-%m-%d'),
+                        "Signal RSI": round(short_pos['signal_rsi'], 1),
+                        "Entry Date (Open)": short_pos['entry_date'].strftime('%Y-%m-%d'),
+                        "Entry Open ($)": round(short_pos['entry_open'], 2),
+                        "Exit Date (Open)": d.strftime('%Y-%m-%d'),
+                        "Exit Open ($)": round(today_open, 2),
+                        "Exit Reason": exit_reason,
+                        "Return (%)": round(ret_pct, 2),
+                        "Hold (Days)": short_pos['days_held'],
+                        "Year": d.year,
+                        "Result": "Win" if ret_pct > 0 else "Loss"
+                    })
+                    short_pos = None
+
+        # If both legs are flat at the Open, rebalance the 50/50 combined capital buckets
+        if long_pos is None and short_pos is None:
+            total_comb_cash = comb_long_cap + comb_short_cap
+            comb_long_cap = total_comb_cash * 0.5
+            comb_short_cap = total_comb_cash * 0.5
+
+        # --------------------------------------------------
+        # STEP B: RANK ETFs AT YESTERDAY'S CLOSE (prev_d) -> ENTER AT TODAY'S OPEN (d)
+        # --------------------------------------------------
+        can_enter_long = (long_pos is None)
+        can_enter_short = (short_pos is None)
+
+        if "Synchronized" in execution_mode:
+            # Only open new positions when BOTH legs are flat
+            if not (long_pos is None and short_pos is None):
+                can_enter_long = False
+                can_enter_short = False
+
+        if can_enter_long or can_enter_short:
+            valid_etfs = []
+            for sym, df_sym in etf_dfs.items():
+                if prev_d in df_sym.index and d in df_sym.index:
+                    p_row = df_sym.loc[prev_d]
+                    t_open = float(df_sym.loc[d, 'Open_Adj'])
+                    r_val = float(p_row[rsi_col])
+                    c_val = float(p_row['Close_Adj'])
+                    sma5_val = float(p_row['SMA_5'])
+                    if pd.notna(r_val) and pd.notna(t_open) and t_open > 0 and pd.notna(sma5_val):
+                        valid_etfs.append({
+                            "ticker": sym,
+                            "rsi": r_val,
+                            "close": c_val,
+                            "sma5": sma5_val,
+                            "next_open": t_open
+                        })
+
+            if len(valid_etfs) >= 2:
+                # Sort ascending by RSI(2)
+                valid_etfs.sort(key=lambda x: x['rsi'])
+
+                # 1. Select Lowest RSI(2) ETF for Long Leg
+                if can_enter_long:
+                    long_candidates = [
+                        x for x in valid_etfs
+                        if x['rsi'] <= max_long_rsi
+                        and (not require_pre_exit_side or x['close'] <= x['sma5'])
+                        and (short_pos is None or x['ticker'] != short_pos['ticker'])
+                    ]
+                    if long_candidates:
+                        pick_l = long_candidates[0]  # Lowest RSI
+                        long_pos = {
+                            "ticker": pick_l['ticker'],
+                            "signal_date": prev_d,
+                            "signal_rsi": pick_l['rsi'],
+                            "entry_date": d,
+                            "entry_open": pick_l['next_open'],
+                            "days_held": 0,
+                            "leg_cap": long_eq,
+                            "comb_cap": comb_long_cap
+                        }
+
+                # 2. Select Highest RSI(2) ETF for Short Leg
+                if can_enter_short:
+                    short_candidates = [
+                        x for x in reversed(valid_etfs)
+                        if x['rsi'] >= min_short_rsi
+                        and (not require_pre_exit_side or x['close'] >= x['sma5'])
+                        and (long_pos is None or x['ticker'] != long_pos['ticker'])
+                    ]
+                    if short_candidates:
+                        pick_s = short_candidates[0]  # Highest RSI
+                        short_pos = {
+                            "ticker": pick_s['ticker'],
+                            "signal_date": prev_d,
+                            "signal_rsi": pick_s['rsi'],
+                            "entry_date": d,
+                            "entry_open": pick_s['next_open'],
+                            "days_held": 0,
+                            "leg_cap": short_eq,
+                            "comb_cap": comb_short_cap
+                        }
+
+        # --------------------------------------------------
+        # STEP C: MARK-TO-MARKET EQUITY AT CLOSE OF DAY (d)
+        # --------------------------------------------------
+        if long_pos is not None and d in etf_dfs[long_pos['ticker']].index:
+            cur_c = float(etf_dfs[long_pos['ticker']].loc[d, 'Close_Adj'])
+            l_ret = (cur_c - long_pos['entry_open']) / long_pos['entry_open']
+            mtm_long_only = long_pos['leg_cap'] * (1.0 + l_ret)
+            mtm_comb_long = long_pos['comb_cap'] * (1.0 + l_ret)
+        else:
+            mtm_long_only = long_eq
+            mtm_comb_long = comb_long_cap
+
+        if short_pos is not None and d in etf_dfs[short_pos['ticker']].index:
+            cur_c = float(etf_dfs[short_pos['ticker']].loc[d, 'Close_Adj'])
+            s_ret = max(-1.0, (short_pos['entry_open'] - cur_c) / short_pos['entry_open'])
+            mtm_short_only = short_pos['leg_cap'] * (1.0 + s_ret)
+            mtm_comb_short = short_pos['comb_cap'] * (1.0 + s_ret)
+        else:
+            mtm_short_only = short_eq
+            mtm_comb_short = comb_short_cap
+
+        equity_records.append({
+            "Date": d,
+            "Combined_Equity": mtm_comb_long + mtm_comb_short,
+            "Long_Only_Equity": mtm_long_only,
+            "Short_Only_Equity": mtm_short_only
+        })
+
+    equity_df = pd.DataFrame(equity_records).set_index("Date")
+    trades_df = pd.DataFrame(trades)
+
+    if equity_df.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    # --------------------------------------------------
+    # STEP D: YEAR-BY-YEAR SUMMARY & PER-TICKER ATTRIBUTION
+    # --------------------------------------------------
+    equity_df['Year'] = equity_df.index.year
+    yearly_rows = []
+
+    for yr, grp in equity_df.groupby('Year'):
+        c_ret = ((grp['Combined_Equity'].iloc[-1] / grp['Combined_Equity'].iloc[0]) - 1.0) * 100.0
+        l_ret = ((grp['Long_Only_Equity'].iloc[-1] / grp['Long_Only_Equity'].iloc[0]) - 1.0) * 100.0
+        s_ret = ((grp['Short_Only_Equity'].iloc[-1] / grp['Short_Only_Equity'].iloc[0]) - 1.0) * 100.0
+
+        c_dd = ((grp['Combined_Equity'] - grp['Combined_Equity'].cummax()) / grp['Combined_Equity'].cummax()).min() * 100.0
+
+        yr_tr = trades_df[trades_df['Year'] == yr] if not trades_df.empty else pd.DataFrame()
+        yr_l = yr_tr[yr_tr['Leg'] == 'LONG'] if not yr_tr.empty else pd.DataFrame()
+        yr_s = yr_tr[yr_tr['Leg'] == 'SHORT'] if not yr_tr.empty else pd.DataFrame()
+
+        n_tr = len(yr_tr)
+        wr_all = (yr_tr['Return (%)'] > 0).mean() * 100.0 if n_tr > 0 else 0.0
+        wr_l = (yr_l['Return (%)'] > 0).mean() * 100.0 if len(yr_l) > 0 else 0.0
+        wr_s = (yr_s['Return (%)'] > 0).mean() * 100.0 if len(yr_s) > 0 else 0.0
+
+        gains = yr_tr[yr_tr['Return (%)'] > 0]['Return (%)'].sum() if n_tr > 0 else 0.0
+        losses = abs(yr_tr[yr_tr['Return (%)'] < 0]['Return (%)'].sum()) if n_tr > 0 else 0.0
+        pf = round(gains / losses, 2) if losses > 0 else (99.0 if gains > 0 else np.nan)
+
+        yearly_rows.append({
+            "Year": str(yr),
+            "Total Trades": int(n_tr),
+            "Long Trades": int(len(yr_l)),
+            "Short Trades": int(len(yr_s)),
+            "Long Win Rate (%)": round(wr_l, 1),
+            "Short Win Rate (%)": round(wr_s, 1),
+            "Combined Win Rate (%)": round(wr_all, 1),
+            "Profit Factor": pf,
+            "Long-Only Return (%)": round(l_ret, 2),
+            "Short-Only Return (%)": round(s_ret, 2),
+            "Combined L/S Return (%)": round(c_ret, 2),
+            "Combined Max DD (%)": round(c_dd, 1)
+        })
+
+    # Overall All-Years Row
+    tot_c_ret = ((equity_df['Combined_Equity'].iloc[-1] / initial_capital) - 1.0) * 100.0
+    tot_l_ret = ((equity_df['Long_Only_Equity'].iloc[-1] / initial_capital) - 1.0) * 100.0
+    tot_s_ret = ((equity_df['Short_Only_Equity'].iloc[-1] / initial_capital) - 1.0) * 100.0
+    tot_c_dd = ((equity_df['Combined_Equity'] - equity_df['Combined_Equity'].cummax()) / equity_df['Combined_Equity'].cummax()).min() * 100.0
+
+    if not trades_df.empty:
+        all_l = trades_df[trades_df['Leg'] == 'LONG']
+        all_s = trades_df[trades_df['Leg'] == 'SHORT']
+        wr_all = (trades_df['Return (%)'] > 0).mean() * 100.0
+        wr_l = (all_l['Return (%)'] > 0).mean() * 100.0 if len(all_l) > 0 else 0.0
+        wr_s = (all_s['Return (%)'] > 0).mean() * 100.0 if len(all_s) > 0 else 0.0
+        g_all = trades_df[trades_df['Return (%)'] > 0]['Return (%)'].sum()
+        l_all = abs(trades_df[trades_df['Return (%)'] < 0]['Return (%)'].sum())
+        pf_all = round(g_all / l_all, 2) if l_all > 0 else np.nan
+    else:
+        all_l, all_s = pd.DataFrame(), pd.DataFrame()
+        wr_all, wr_l, wr_s, pf_all = 0.0, 0.0, 0.0, np.nan
+
+    yearly_rows.append({
+        "Year": "All Years",
+        "Total Trades": int(len(trades_df)),
+        "Long Trades": int(len(all_l)),
+        "Short Trades": int(len(all_s)),
+        "Long Win Rate (%)": round(wr_l, 1),
+        "Short Win Rate (%)": round(wr_s, 1),
+        "Combined Win Rate (%)": round(wr_all, 1),
+        "Profit Factor": pf_all,
+        "Long-Only Return (%)": round(tot_l_ret, 2),
+        "Short-Only Return (%)": round(tot_s_ret, 2),
+        "Combined L/S Return (%)": round(tot_c_ret, 2),
+        "Combined Max DD (%)": round(tot_c_dd, 1)
+    })
+
+    yearly_df = pd.DataFrame(yearly_rows).set_index("Year")
+
+    # Per-Ticker Attribution Table
+    ticker_attr_rows = []
+    if not trades_df.empty:
+        for sym in sorted(etf_dfs.keys()):
+            sub_t = trades_df[trades_df['Ticker'] == sym]
+            sub_l = sub_t[sub_t['Leg'] == 'LONG']
+            sub_s = sub_t[sub_t['Leg'] == 'SHORT']
+
+            l_cnt = len(sub_l)
+            s_cnt = len(sub_s)
+            l_wr = (sub_l['Return (%)'] > 0).mean() * 100.0 if l_cnt > 0 else 0.0
+            s_wr = (sub_s['Return (%)'] > 0).mean() * 100.0 if s_cnt > 0 else 0.0
+            l_avg = sub_l['Return (%)'].mean() if l_cnt > 0 else 0.0
+            s_avg = sub_s['Return (%)'].mean() if s_cnt > 0 else 0.0
+            tot_avg = sub_t['Return (%)'].mean() if len(sub_t) > 0 else 0.0
+
+            ticker_attr_rows.append({
+                "Ticker": sym,
+                "Total Trades": int(len(sub_t)),
+                "Long Trades": int(l_cnt),
+                "Long Win Rate (%)": round(l_wr, 1),
+                "Long Avg Ret (%)": round(l_avg, 2),
+                "Short Trades": int(s_cnt),
+                "Short Win Rate (%)": round(s_wr, 1),
+                "Short Avg Ret (%)": round(s_avg, 2),
+                "Overall Avg Ret (%)": round(tot_avg, 2)
+            })
+    ticker_attr_df = pd.DataFrame(ticker_attr_rows).set_index("Ticker") if ticker_attr_rows else pd.DataFrame()
+
+    return yearly_df, equity_df, trades_df, ticker_attr_df
+
+# ==========================================
+# 3. SINGLE-TICKER & MONITOR HELPER FUNCTIONS
+# ==========================================
+
 def solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, current_rsi, target_rsi):
-    """
-    Computes the exact Next-Day Close Price required for 1-Day Wilder's RSI(2) to reach `target_rsi`.
-    """
     if pd.isna(last_close) or pd.isna(avg_gain) or pd.isna(avg_loss):
         return np.nan
     if target_rsi <= 0.0 or target_rsi >= 100.0:
@@ -288,10 +673,6 @@ def solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, current_rsi, targe
         return max(0.01, float(last_close - max(0.0, req_loss)))
 
 def solve_next_close_for_nday_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list, n_days, target_avg_rsi):
-    """
-    Computes the exact Next-Day Close Price required so the N-Day Average RSI(2)
-    crosses `target_avg_rsi` on tomorrow's close.
-    """
     if n_days == 1:
         return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], target_avg_rsi)
 
@@ -306,10 +687,6 @@ def solve_next_close_for_nday_rsi2(last_close, avg_gain, avg_loss, recent_rsi_li
         return solve_next_close_for_rsi2(last_close, avg_gain, avg_loss, recent_rsi_list[-1], req_1d_rsi)
 
 def compute_ticker_snapshot_row(raw_df, sym, active_rsi_days=2, custom_exit_rsi_days=2, custom_exit_thresh=70):
-    """
-    Computes a single row containing current RSI readings and all Exit Target Prices ($)
-    for the Universe Monitor and Watchlist tables.
-    """
     df = normalize_ohlcv_df(raw_df)
     if len(df) < 200:
         return None
@@ -400,7 +777,6 @@ def compute_ticker_snapshot_row(raw_df, sym, active_rsi_days=2, custom_exit_rsi_
     }
 
 def get_snapshot_column_config(custom_col_name):
-    """Returns strict numeric column configuration so every column sorts properly."""
     return {
         "Ticker": st.column_config.TextColumn("Ticker", pinned=True, width="small"),
         "Last Close ($)": st.column_config.NumberColumn("Last Close ($)", format="$%.2f"),
@@ -411,45 +787,23 @@ def get_snapshot_column_config(custom_col_name):
         "3D RSI(2)": st.column_config.NumberColumn("3D RSI(2)", format="%.1f"),
         "5D RSI(2)": st.column_config.NumberColumn("5D RSI(2)", format="%.1f"),
         "Bucket": st.column_config.TextColumn("Bucket"),
-        "Exit: 5D SMA ($)": st.column_config.NumberColumn(
-            "Exit: 5D SMA ($)", format="$%.2f", help="Current 5-Day Simple Moving Average."
-        ),
-        "Next Close > SMA5 ($)": st.column_config.NumberColumn(
-            "Next Close > SMA5 ($)", format="$%.2f",
-            help="Exact Close price needed tomorrow so tomorrow's Close finishes above tomorrow's 5-Day SMA."
-        ),
-        "% to 5D SMA": st.column_config.NumberColumn(
-            "% to 5D SMA", format="%+.2f%%", help="Percentage move from Last Close to current 5D SMA."
-        ),
+        "Exit: 5D SMA ($)": st.column_config.NumberColumn("Exit: 5D SMA ($)", format="$%.2f"),
+        "Next Close > SMA5 ($)": st.column_config.NumberColumn("Next Close > SMA5 ($)", format="$%.2f"),
+        "% to 5D SMA": st.column_config.NumberColumn("% to 5D SMA", format="%+.2f%%"),
         "Exit: 3D High ($)": st.column_config.NumberColumn("Exit: 3D High ($)", format="$%.2f"),
         "Exit: 5D High ($)": st.column_config.NumberColumn("Exit: 5D High ($)", format="$%.2f"),
         "Exit: 7D High ($)": st.column_config.NumberColumn("Exit: 7D High ($)", format="$%.2f"),
         "Exit: 10D High ($)": st.column_config.NumberColumn("Exit: 10D High ($)", format="$%.2f"),
-        "Exit: 1D RSI>50 ($)": st.column_config.NumberColumn(
-            "Exit: 1D RSI>50 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 50."
-        ),
-        "Exit: 1D RSI>70 ($)": st.column_config.NumberColumn(
-            "Exit: 1D RSI>70 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 70."
-        ),
-        "Exit: 1D RSI>80 ($)": st.column_config.NumberColumn(
-            "Exit: 1D RSI>80 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 80."
-        ),
-        "Exit: 1D RSI>90 ($)": st.column_config.NumberColumn(
-            "Exit: 1D RSI>90 ($)", format="$%.2f", help="Next Close price required for 1D RSI(2) to cross 90."
-        ),
-        custom_col_name: st.column_config.NumberColumn(
-            custom_col_name, format="$%.2f",
-            help="Next Close price required for the selected N-Day RSI(2) to cross the target threshold (NaN if unreachable in 1 session)."
-        ),
+        "Exit: 1D RSI>50 ($)": st.column_config.NumberColumn("Exit: 1D RSI>50 ($)", format="$%.2f"),
+        "Exit: 1D RSI>70 ($)": st.column_config.NumberColumn("Exit: 1D RSI>70 ($)", format="$%.2f"),
+        "Exit: 1D RSI>80 ($)": st.column_config.NumberColumn("Exit: 1D RSI>80 ($)", format="$%.2f"),
+        "Exit: 1D RSI>90 ($)": st.column_config.NumberColumn("Exit: 1D RSI>90 ($)", format="$%.2f"),
+        custom_col_name: st.column_config.NumberColumn(custom_col_name, format="$%.2f"),
         "200D SMA ($)": st.column_config.NumberColumn("200D SMA ($)", format="$%.2f"),
         "% vs 200 SMA": st.column_config.NumberColumn("% vs 200 SMA", format="%+.2f%%")
     }
 
 def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
-    """
-    Computes adjusted OHLC, N-day RSI(2) buckets, and Next-Open forward trade outcomes
-    for all exit strategies.
-    """
     df = normalize_ohlcv_df(raw_df)
     if df.empty:
         return pd.DataFrame()
@@ -569,10 +923,6 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
 
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
-
-# ==========================================
-# CANDLESTICK + 2-DAY & 5-DAY RSI(2) CHART
-# ==========================================
 
 def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
     plot_df = df.iloc[-lookback_bars:].copy() if lookback_bars and len(df) > lookback_bars else df.copy()
@@ -694,10 +1044,6 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
     )
 
     return fig
-
-# ==========================================
-# 2. TABLE & SUMMARY BUILDERS
-# ==========================================
 
 def filter_signal_rows(df, require_uptrend=True, fresh_only=False):
     data = df.dropna(subset=['Bucket']).copy()
@@ -851,7 +1197,7 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
     return pd.DataFrame(yearly_rows).set_index("Year"), trades_df
 
 # ==========================================
-# 3. MULTI-STOCK PORTFOLIO ENGINE (NEXT OPEN)
+# 4. MULTI-STOCK LONG-ONLY PORTFOLIO ENGINE
 # ==========================================
 
 def run_portfolio_backtest_next_open(
@@ -1053,14 +1399,10 @@ def run_portfolio_backtest_next_open(
     return pd.DataFrame(yearly_records).set_index("Year"), equity_df, trades_df
 
 # ==========================================
-# 4. ZERO-LXML UNIVERSE FETCHERS & CACHING
+# 5. ZERO-LXML UNIVERSE FETCHERS & CACHING
 # ==========================================
 
 def parse_wiki_tickers_regex(url):
-    """
-    Zero-dependency HTML parser that extracts stock symbols from Wikipedia constituent tables
-    without needing `lxml` or `beautifulsoup4`.
-    """
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
     try:
         resp = requests.get(url, headers=headers, timeout=10)
@@ -1096,9 +1438,6 @@ def parse_wiki_tickers_regex(url):
     return []
 
 def fetch_ishares_russell2000():
-    """
-    Fetches the full ~1,950 Russell 2000 constituent list directly from BlackRock/iShares IWM ETF CSV.
-    """
     url = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/1467271812596.ajax?fileType=csv&fileName=IWM_holdings&dataType=fund"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
@@ -1129,9 +1468,7 @@ def fetch_ishares_russell2000():
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def get_universe_tickers(universe_name):
-    """Returns comprehensive constituent lists for each selected universe."""
     if universe_name == "S&P 500":
-        # 1. Try GitHub CSV dataset (no lxml needed)
         try:
             url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
             df_sp = pd.read_csv(url)
@@ -1140,11 +1477,9 @@ def get_universe_tickers(universe_name):
                 return list(dict.fromkeys(syms + SP500_FULL_FALLBACK))
         except Exception:
             pass
-        # 2. Try Wikipedia Regex Parser
         wiki_sp = parse_wiki_tickers_regex("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         if len(wiki_sp) >= 490:
             return list(dict.fromkeys(wiki_sp + SP500_FULL_FALLBACK))
-        # 3. Guaranteed 500+ Built-In S&P 500 Roster
         return list(dict.fromkeys(SP500_FULL_FALLBACK))
 
     elif universe_name == "Nasdaq 100":
@@ -1160,11 +1495,9 @@ def get_universe_tickers(universe_name):
         return list(dict.fromkeys(DJIA_30_TICKERS))
 
     elif "Russell 2000" in universe_name:
-        # 1. Try Official iShares Russell 2000 (IWM) CSV (~1,950 stocks)
         iwm_tickers = fetch_ishares_russell2000()
         if len(iwm_tickers) >= 500:
             return iwm_tickers
-        # 2. Combine Wikipedia S&P 600 SmallCap + Built-in Small-Cap Roster (~650+ stocks)
         wiki_sc = parse_wiki_tickers_regex("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies")
         return list(dict.fromkeys(wiki_sc + RUSSELL_SMALLCAP_FALLBACK))
 
@@ -1181,7 +1514,6 @@ def fetch_daily_data(symbol, start, end):
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def fetch_chunk_recent_data(tickers_tuple, days_back=340):
-    """Cached batch downloader for a chunk of tickers."""
     t_list = list(tickers_tuple)
     if not t_list:
         return pd.DataFrame()
@@ -1197,11 +1529,22 @@ def fetch_chunk_recent_data(tickers_tuple, days_back=340):
         threads=True
     )
 
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_bulk_history_cached(tickers_tuple, start_str, end_str):
+    t_list = list(tickers_tuple)
+    if not t_list:
+        return pd.DataFrame()
+    return yf.download(
+        t_list,
+        start=start_str,
+        end=end_str,
+        group_by="ticker",
+        auto_adjust=False,
+        progress=False,
+        threads=True
+    )
+
 def load_universe_snapshots_batched(tickers_list, active_rsi_days, custom_exit_days, custom_exit_thresh, batch_size=125):
-    """
-    Downloads and computes snapshot rows across large universes (100 to 2,000 stocks)
-    in fast cached batches with a visual progress bar.
-    """
     total = len(tickers_list)
     if total == 0:
         return []
@@ -1243,18 +1586,300 @@ def load_universe_snapshots_batched(tickers_list, active_rsi_days, custom_exit_d
     return rows
 
 # ==========================================
-# 5. INTERFACE TABS (4 SEPARATE TABS)
+# 6. INTERFACE TABS (5 SEPARATE TABS)
 # ==========================================
 
-tab_study, tab_screener, tab_watchlist, tab_portfolio = st.tabs([
-    "📊 Single Ticker Study (Next-Open)",
+tab_ls, tab_study, tab_screener, tab_watchlist, tab_portfolio = st.tabs([
+    "⚖️ Long/Short RSI(2) Basket",
+    "📊 Single Ticker Study",
     "🌐 Universe Monitor & Exit Prices",
     "📋 Custom Watchlist & Exit Prices",
     "📁 Multi-Stock Portfolio Backtester"
 ])
 
 # ----------------------------------------------------
-# TAB 1: SINGLE TICKER STUDY (WITH CANDLESTICK & RSI SUBPLOTS)
+# TAB 1: LONG/SHORT EXTREME RSI(2) BASKET BACKTESTER
+# ----------------------------------------------------
+with tab_ls:
+    st.subheader("⚖️ Long Lowest RSI(2) / Short Highest RSI(2) Basket Backtester")
+    st.caption(
+        "Strategy Rules: Rank all basket ETFs at the Close → Buy the ETF with the Lowest X-Day RSI(2) at Next Open (Exit when Close > 5D SMA) | "
+        "Short the ETF with the Highest X-Day RSI(2) at Next Open (Cover when Close < 5D SMA)."
+    )
+
+    ls_c1, ls_c2, ls_c3 = st.columns([2.2, 1.1, 0.9])
+    with ls_c1:
+        ls_tickers_input = st.text_input(
+            "ETF Basket Tickers (comma or space separated)",
+            value=", ".join(DEFAULT_LS_BASKET),
+            key="ls_basket_input"
+        )
+    with ls_c2:
+        ls_rsi_choice = st.selectbox(
+            "Primary X-Day RSI(2) Lookback",
+            ["1-Day RSI(2)", "2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
+            index=1,
+            key="ls_rsi_lookback"
+        )
+        ls_rsi_days = RSI_DAYS_MAP[ls_rsi_choice]
+    with ls_c3:
+        ls_years = st.number_input("Backtest History (Years)", min_value=2, max_value=20, value=10, key="ls_years")
+
+    ls_c4, ls_c5, ls_c6, ls_c7 = st.columns([1.4, 1.1, 1.1, 1.0])
+    with ls_c4:
+        ls_exec_mode = st.selectbox(
+            "Leg Execution Mode",
+            [
+                "Independent Legs (Re-enter each leg as soon as it exits)",
+                "Synchronized Pair (Wait until both legs exit before next pair)"
+            ],
+            index=0,
+            key="ls_exec_mode"
+        )
+    with ls_c5:
+        ls_max_long_rsi = st.slider(
+            "Max RSI(2) Allowed for Long Entry",
+            min_value=10, max_value=100, value=100, step=5,
+            help="Set to 100 to always buy the lowest RSI ETF, or lower (e.g. 30) to require an oversold reading."
+        )
+    with ls_c6:
+        ls_min_short_rsi = st.slider(
+            "Min RSI(2) Required for Short Entry",
+            min_value=0, max_value=90, value=0, step=5,
+            help="Set to 0 to always short the highest RSI ETF, or raise (e.g. 70) to require an overbought reading."
+        )
+    with ls_c7:
+        ls_exclude_3x = st.checkbox(
+            "Exclude 3x ETFs (SOXL, LABU, JNUG, GUSH)",
+            value=False,
+            help="Toggle to see performance with vs. without the 4 leveraged ETFs."
+        )
+        ls_pre_exit_check = st.checkbox(
+            "Require Long < SMA5 & Short > SMA5",
+            value=True,
+            help="Ensures the Long candidate is currently below its 5-day SMA and the Short candidate is currently above its 5-day SMA on signal close."
+        )
+
+    ls_tickers = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', ls_tickers_input) if s.strip()]))
+    if ls_exclude_3x:
+        ls_tickers = [t for t in ls_tickers if t not in {"SOXL", "LABU", "JNUG", "GUSH"}]
+
+    if len(ls_tickers) < 2:
+        st.warning("Please enter at least 2 valid ETF tickers in the basket.")
+    else:
+        s_ls = (datetime.now() - timedelta(days=ls_years * 365)).strftime('%Y-%m-%d')
+        e_ls = datetime.now().strftime('%Y-%m-%d')
+
+        with st.spinner(f"Loading daily data and running Long/Short simulation across {len(ls_tickers)} ETFs..."):
+            bulk_ls = fetch_bulk_history_cached(tuple(ls_tickers), s_ls, e_ls)
+            etf_dfs = {}
+            for sym in ls_tickers:
+                d_sym = extract_symbol_daily(bulk_ls, sym, len(ls_tickers))
+                prep_sym = prepare_ls_etf_data(d_sym)
+                if not prep_sym.empty:
+                    etf_dfs[sym] = prep_sym
+
+        if len(etf_dfs) < 2:
+            st.error("Could not retrieve sufficient historical data for at least 2 ETFs in the basket.")
+        else:
+            # --------------------------------------------------
+            # 1. CURRENT LIVE BASKET RANKING & NEXT-OPEN SIGNALS
+            # --------------------------------------------------
+            live_rank_rows = []
+            for sym, df_sym in etf_dfs.items():
+                last_r = df_sym.iloc[-1]
+                c_px = float(last_r['Close_Adj'])
+                sma5_px = float(last_r['SMA_5'])
+                dist_sma5 = (c_px - sma5_px) / sma5_px * 100.0
+                live_rank_rows.append({
+                    "Ticker": sym,
+                    "Last Date": df_sym.index[-1].strftime('%Y-%m-%d'),
+                    "Last Close ($)": round(c_px, 2),
+                    "5D SMA ($)": round(sma5_px, 2),
+                    "Close vs 5D SMA (%)": round(dist_sma5, 2),
+                    "Position vs SMA(5)": "Below SMA5 (Long Eligible)" if c_px <= sma5_px else "Above SMA5 (Short Eligible)",
+                    "1-Day RSI(2)": round(float(last_r['RSI2_1d']), 1),
+                    "2-Day RSI(2)": round(float(last_r['RSI2_2d']), 1),
+                    "3-Day RSI(2)": round(float(last_r['RSI2_3d']), 1),
+                    "5-Day RSI(2)": round(float(last_r['RSI2_5d']), 1),
+                    "Active_RSI": float(last_r[f"RSI2_{ls_rsi_days}d"])
+                })
+
+            rank_df = pd.DataFrame(live_rank_rows).sort_values(by="Active_RSI", ascending=True).reset_index(drop=True)
+            lowest_row = rank_df.iloc[0]
+            highest_row = rank_df.iloc[-1]
+
+            st.divider()
+            st.markdown(f"#### 🎯 Current Basket Extremes (Ranked by **{ls_rsi_choice}** as of {lowest_row['Last Date']} Close)")
+            sig_c1, sig_c2, sig_c3, sig_c4 = st.columns(4)
+            sig_c1.metric(
+                f"🟢 LONG Candidate (Lowest {ls_rsi_choice})",
+                f"{lowest_row['Ticker']} (${lowest_row['Last Close ($)']:.2f})",
+                f"RSI: {lowest_row['Active_RSI']:.1f}"
+            )
+            sig_c2.metric(
+                f"{lowest_row['Ticker']} Long Exit Target (> 5D SMA)",
+                f"${lowest_row['5D SMA ($)']:.2f}",
+                f"{lowest_row['Close vs 5D SMA (%)']:+.2f}% vs SMA5"
+            )
+            sig_c3.metric(
+                f"🔴 SHORT Candidate (Highest {ls_rsi_choice})",
+                f"{highest_row['Ticker']} (${highest_row['Last Close ($)']:.2f})",
+                f"RSI: {highest_row['Active_RSI']:.1f}"
+            )
+            sig_c4.metric(
+                f"{highest_row['Ticker']} Short Cover Target (< 5D SMA)",
+                f"${highest_row['5D SMA ($)']:.2f}",
+                f"{highest_row['Close vs 5D SMA (%)']:+.2f}% vs SMA5"
+            )
+
+            with st.expander("📋 View Full 13-ETF Live RSI(2) Ranking Table (Lowest → Highest)", expanded=False):
+                display_rank_df = rank_df.drop(columns=["Active_RSI"])
+                st.dataframe(display_rank_df, hide_index=True, use_container_width=True)
+
+            # --------------------------------------------------
+            # 2. COMPARE ALL X-DAY RSI(2) LOOKBACKS (1D, 2D, 3D, 5D)
+            # --------------------------------------------------
+            st.divider()
+            st.subheader("1. Compare X-Day RSI(2) Lookback Horizons (1D vs. 2D vs. 3D vs. 5D)")
+            st.caption("Side-by-side backtest comparison across all four RSI(2) smoothing lookbacks on this exact ETF basket.")
+
+            comp_lookback_rows = []
+            cached_runs = {}
+            for lb_label, lb_days in RSI_DAYS_MAP.items():
+                y_df, eq_df, tr_df, attr_df = run_long_short_basket_backtest(
+                    etf_dfs=etf_dfs,
+                    rsi_days=lb_days,
+                    initial_capital=100000.0,
+                    execution_mode=ls_exec_mode,
+                    require_pre_exit_side=ls_pre_exit_check,
+                    max_long_rsi=float(ls_max_long_rsi),
+                    min_short_rsi=float(ls_min_short_rsi),
+                    max_hold_days=20
+                )
+                cached_runs[lb_days] = (y_df, eq_df, tr_df, attr_df)
+                if not y_df.empty:
+                    ov = y_df.loc["All Years"]
+                    comp_lookback_rows.append({
+                        "RSI(2) Lookback": lb_label,
+                        "Total Trades": int(ov["Total Trades"]),
+                        "Long Win Rate (%)": ov["Long Win Rate (%)"],
+                        "Short Win Rate (%)": ov["Short Win Rate (%)"],
+                        "Combined Win Rate (%)": ov["Combined Win Rate (%)"],
+                        "Profit Factor": ov["Profit Factor"],
+                        "Long-Only Total Ret (%)": ov["Long-Only Return (%)"],
+                        "Short-Only Total Ret (%)": ov["Short-Only Return (%)"],
+                        "Combined L/S Total Ret (%)": ov["Combined L/S Return (%)"],
+                        "Combined Max DD (%)": ov["Combined Max DD (%)"]
+                    })
+
+            if comp_lookback_rows:
+                comp_lb_df = pd.DataFrame(comp_lookback_rows).set_index("RSI(2) Lookback")
+                lb_cfg = {
+                    "Total Trades": st.column_config.NumberColumn(format="%d"),
+                    "Long Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Short Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Combined Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+                    "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                    "Long-Only Total Ret (%)": st.column_config.NumberColumn(format="%+,.2f%%"),
+                    "Short-Only Total Ret (%)": st.column_config.NumberColumn(format="%+,.2f%%"),
+                    "Combined L/S Total Ret (%)": st.column_config.NumberColumn(format="%+,.2f%%"),
+                    "Combined Max DD (%)": st.column_config.NumberColumn(format="%.1f%%")
+                }
+                st.dataframe(comp_lb_df, column_config=lb_cfg, use_container_width=True)
+
+            # --------------------------------------------------
+            # 3. DETAILED RESULTS FOR SELECTED X-DAY RSI(2)
+            # --------------------------------------------------
+            ls_yearly_df, ls_equity_df, ls_trades_df, ls_attr_df = cached_runs[ls_rsi_days]
+
+            if not ls_yearly_df.empty:
+                st.divider()
+                st.subheader(f"2. Detailed Performance & Leg Attribution — **{ls_rsi_choice}**")
+                ov_sel = ls_yearly_df.loc["All Years"]
+
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
+                k1.metric("Combined L/S Return", f"{ov_sel['Combined L/S Return (%)']:+,.2f}%")
+                k2.metric("Long-Only Return", f"{ov_sel['Long-Only Return (%)']:+,.2f}%")
+                k3.metric("Short-Only Return", f"{ov_sel['Short-Only Return (%)']:+,.2f}%")
+                k4.metric("Long / Short Win Rate", f"{ov_sel['Long Win Rate (%)']:.1f}% / {ov_sel['Short Win Rate (%)']:.1f}%")
+                k5.metric("Profit Factor", f"{ov_sel['Profit Factor']}")
+                k6.metric("Combined Max DD", f"{ov_sel['Combined Max DD (%)']:.1f}%")
+
+                # Equity Curve Chart (Combined vs Long-Only vs Short-Only)
+                fig_ls_eq = go.Figure()
+                fig_ls_eq.add_trace(go.Scatter(
+                    x=ls_equity_df.index, y=ls_equity_df['Combined_Equity'],
+                    mode='lines', name='Combined 50/50 Long/Short ($)',
+                    line=dict(color='#00E676', width=2.6)
+                ))
+                fig_ls_eq.add_trace(go.Scatter(
+                    x=ls_equity_df.index, y=ls_equity_df['Long_Only_Equity'],
+                    mode='lines', name='Long Leg Only (Lowest RSI)',
+                    line=dict(color='#29B6F6', width=1.8, dash='dot')
+                ))
+                fig_ls_eq.add_trace(go.Scatter(
+                    x=ls_equity_df.index, y=ls_equity_df['Short_Only_Equity'],
+                    mode='lines', name='Short Leg Only (Highest RSI)',
+                    line=dict(color='#FF5252', width=1.8, dash='dash')
+                ))
+                fig_ls_eq.update_layout(
+                    title=f"Equity Curve Attribution ($100,000 Start) — {ls_rsi_choice}",
+                    template="plotly_dark",
+                    yaxis_title="Account Equity ($)",
+                    xaxis_title="Date",
+                    height=430,
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=20, r=20, t=50, b=20)
+                )
+                st.plotly_chart(fig_ls_eq, use_container_width=True)
+
+                # Year-by-Year Table & Per-Ticker Attribution
+                col_y_ls, col_attr_ls = st.columns([1.45, 1.35])
+                with col_y_ls:
+                    st.markdown(f"##### 📅 Year-by-Year Results ({ls_rsi_choice})")
+                    yr_ls_cfg = {
+                        "Total Trades": st.column_config.NumberColumn(format="%d"),
+                        "Long Trades": st.column_config.NumberColumn(format="%d"),
+                        "Short Trades": st.column_config.NumberColumn(format="%d"),
+                        "Long Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Short Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Combined Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+                        "Long-Only Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "Short-Only Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "Combined L/S Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                        "Combined Max DD (%)": st.column_config.NumberColumn(format="%.1f%%")
+                    }
+                    st.dataframe(ls_yearly_df, column_config=yr_ls_cfg, use_container_width=True, height=420)
+
+                with col_attr_ls:
+                    st.markdown(f"##### 📊 Per-ETF Long vs. Short Breakdown ({ls_rsi_choice})")
+                    if not ls_attr_df.empty:
+                        attr_cfg = {
+                            "Total Trades": st.column_config.NumberColumn(format="%d"),
+                            "Long Trades": st.column_config.NumberColumn(format="%d"),
+                            "Long Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Long Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "Short Trades": st.column_config.NumberColumn(format="%d"),
+                            "Short Win Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Short Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+                            "Overall Avg Ret (%)": st.column_config.NumberColumn(format="%+.2f%%")
+                        }
+                        st.dataframe(ls_attr_df, column_config=attr_cfg, use_container_width=True, height=420)
+
+                with st.expander(f"🔎 View Complete Long/Short Trade Audit Log ({len(ls_trades_df)} Trades)"):
+                    st.download_button(
+                        label="📥 Download Long/Short Trade Log (CSV)",
+                        data=ls_trades_df.to_csv(index=False).encode('utf-8'),
+                        file_name=f"long_short_rsi2_{ls_rsi_days}d_trades.csv",
+                        mime="text/csv"
+                    )
+                    st.dataframe(ls_trades_df.sort_values(by="Exit Date (Open)", ascending=False), use_container_width=True)
+
+# ----------------------------------------------------
+# TAB 2: SINGLE TICKER STUDY (WITH CANDLESTICK & RSI SUBPLOTS)
 # ----------------------------------------------------
 with tab_study:
     st.subheader("Strategy Configuration")
@@ -1266,8 +1891,7 @@ with tab_study:
         rsi_choice = st.selectbox(
             "RSI(2) Lookback",
             ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
-            index=0,
-            help="Selects whether entry buckets and RSI exit thresholds use the 2-day, 3-day, or 5-day average of RSI(2)."
+            index=0
         )
     with c3:
         signal_mode = st.selectbox(
@@ -1287,8 +1911,7 @@ with tab_study:
         selected_exit_label = st.selectbox(
             "Exit Rule (Executed on Next Day's Open)",
             list(exit_label_map.values()),
-            index=0,
-            help="When this condition is met at the Close, the trade exits at the following day's Open."
+            index=0
         )
         active_exit_key = inv_exit_label_map[selected_exit_label]
     with c6:
@@ -1312,11 +1935,7 @@ with tab_study:
         )
     with c7:
         st.write("")
-        require_uptrend_study = st.checkbox(
-            "Require Close > 200-Day SMA",
-            value=True,
-            help="Only take entry signals when the stock closes above its 200-day simple moving average."
-        )
+        require_uptrend_study = st.checkbox("Require Close > 200-Day SMA", value=True)
 
     if "All Oversold" in bucket_preset:
         active_buckets = ['<10', '11-20']
@@ -1355,9 +1974,6 @@ with tab_study:
         m4.metric(f"{rsi_choice} Bucket", curr_bucket)
         m5.metric("200-Day SMA Trend", "Above (Bullish)" if is_bull else "Below (Bearish)")
 
-        # ==========================================
-        # PRICE CANDLESTICK & 2D / 5D RSI(2) SUBPLOTS
-        # ==========================================
         st.divider()
         ch_col1, ch_col2 = st.columns([2.8, 1.2])
         with ch_col1:
@@ -1388,16 +2004,8 @@ with tab_study:
         )
         st.plotly_chart(fig_candles, use_container_width=True)
 
-        # ==========================================
-        # SECTION 1: ENTRY BUCKET BREAKDOWN
-        # ==========================================
         st.divider()
         st.subheader(f"1. Performance by Entry Bucket — Exit: {selected_exit_label} (Next Open)")
-        st.caption(
-            f"Shows how each **{rsi_choice}** entry bucket performed when entering on the Next Day's Open "
-            f"and exiting on the Next Day's Open after **{selected_exit_label}**."
-        )
-
         bucket_table = build_bucket_table(filtered_df, active_exit_key)
 
         col_tbl, col_charts = st.columns([1.35, 1.65])
@@ -1433,9 +2041,6 @@ with tab_study:
             )
             st.plotly_chart(fig_b, use_container_width=True)
 
-        # ==========================================
-        # SECTION 2: EXIT STRATEGY COMPARISON
-        # ==========================================
         st.divider()
         bucket_title_str = ", ".join(active_buckets) if len(active_buckets) <= 3 else "All 10 Buckets"
         st.subheader(f"2. Compare All Exit Rules — Entry Bucket(s): {bucket_title_str}")
@@ -1446,9 +2051,6 @@ with tab_study:
         ])
 
         with sub_tab1:
-            st.caption(
-                f"Compares all available Next-Open exit rules side-by-side when entering on **{rsi_choice}** in bucket(s): **{bucket_title_str}**."
-            )
             exit_comp_df = build_exit_comparison_table(filtered_df, active_buckets, exit_label_map)
             st.dataframe(exit_comp_df, column_config=b_cfg, use_container_width=True, height=560)
 
@@ -1471,12 +2073,8 @@ with tab_study:
 
             st.dataframe(matrix_df, column_config=mat_cfg, use_container_width=True)
 
-        # ==========================================
-        # SECTION 3: YEAR-BY-YEAR & TRADE LOG
-        # ==========================================
         st.divider()
         st.subheader(f"3. Year-by-Year Breakdown — Entry: {bucket_title_str} | Exit: {selected_exit_label}")
-
         yearly_df, trades_df = build_yearly_and_trades(processed_df, filtered_df, active_buckets, active_exit_key)
 
         if yearly_df.empty:
@@ -1500,15 +2098,7 @@ with tab_study:
                 fig_yr.add_trace(go.Bar(
                     x=chart_yr.index,
                     y=chart_yr['Compounded Return (%)'],
-                    marker_color=['#00E676' if v >= 0 else '#FF5252' for v in chart_yr['Compounded Return (%)']],
-                    hovertext=[
-                        f"Year: {y}<br>Compounded: {r:+.2f}%<br>Trades: {t}<br>Win Rate: {w:.1f}%"
-                        for y, r, t, w in zip(
-                            chart_yr.index, chart_yr['Compounded Return (%)'],
-                            chart_yr['Trades'], chart_yr['Win Rate (%)']
-                        )
-                    ],
-                    hoverinfo='text'
+                    marker_color=['#00E676' if v >= 0 else '#FF5252' for v in chart_yr['Compounded Return (%)']]
                 ))
                 fig_yr.add_hline(y=0, line_dash="dash", line_color="white")
                 fig_yr.update_layout(
@@ -1521,31 +2111,20 @@ with tab_study:
                 )
                 st.plotly_chart(fig_yr, use_container_width=True)
 
-            with st.expander(f"🔎 View Individual Trade Audit Log ({len(trades_df)} Trades — Next-Open Execution)"):
-                st.download_button(
-                    label="Download Trade Log (CSV)",
-                    data=trades_df.to_csv(index=False).encode('utf-8'),
-                    file_name=f"{study_ticker}_{rsi_choice}_trades.csv",
-                    mime="text/csv"
-                )
+            with st.expander(f"🔎 View Individual Trade Audit Log ({len(trades_df)} Trades)"):
                 st.dataframe(trades_df.sort_values(by="Signal Date (Close)", ascending=False), use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 2: UNIVERSE MONITOR & EXIT PRICES (EXPANDED ROSTERS)
+# TAB 3: UNIVERSE MONITOR & EXIT PRICES
 # ----------------------------------------------------
 with tab_screener:
     st.subheader("🌐 Full Universe Monitor — Current RSI Readings & Target Exit Prices")
-    st.caption(
-        "Select any universe from the dropdown to list all constituent tickers, their live 1D/2D/3D/5D RSI(2) readings, "
-        "and exact target exit prices ($). Click any column header in the table to sort ascending or descending."
-    )
-
     u_c1, u_c2, u_c3, u_c4, u_c5, u_c6 = st.columns([1.3, 1.1, 1.0, 1.0, 1.0, 1.1])
     with u_c1:
         mon_universe = st.selectbox(
             "1. Select Universe",
             [
-                "Major ETFs (105 ETFs)",
+                "Major ETFs (105+ ETFs)",
                 "Dow Jones 30",
                 "Nasdaq 100",
                 "S&P 500",
@@ -1555,7 +2134,6 @@ with tab_screener:
             key="mon_univ_select"
         )
     with u_c2:
-        # Map display label back to canonical universe key
         univ_key = "Major ETFs" if "Major ETFs" in mon_universe else mon_universe
         full_u_roster = get_universe_tickers(univ_key)
         total_avail = len(full_u_roster)
@@ -1576,29 +2154,12 @@ with tab_screener:
             u_tickers = full_u_roster
 
     with u_c3:
-        mon_bucket_rsi = st.selectbox(
-            "Bucket RSI Lookback",
-            ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
-            index=0,
-            key="mon_b_rsi"
-        )
+        mon_bucket_rsi = st.selectbox("Bucket RSI Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=0, key="mon_b_rsi")
         mon_b_days = RSI_DAYS_MAP[mon_bucket_rsi]
     with u_c4:
-        mon_custom_exit_days = st.selectbox(
-            "Custom Exit RSI",
-            [1, 2, 3, 5],
-            index=1,
-            format_func=lambda x: f"{x}-Day RSI(2)",
-            key="mon_cx_days"
-        )
+        mon_custom_exit_days = st.selectbox("Custom Exit RSI", [1, 2, 3, 5], index=1, format_func=lambda x: f"{x}-Day RSI(2)", key="mon_cx_days")
     with u_c5:
-        mon_custom_exit_thresh = st.selectbox(
-            "Custom Exit Threshold",
-            RSI_THRESHOLDS,
-            index=6,
-            format_func=lambda x: f"RSI > {x}",
-            key="mon_cx_thresh"
-        )
+        mon_custom_exit_thresh = st.selectbox("Custom Exit Threshold", RSI_THRESHOLDS, index=6, format_func=lambda x: f"RSI > {x}", key="mon_cx_thresh")
     with u_c6:
         mon_search = st.text_input("Filter Ticker (Optional)", value="", placeholder="e.g. AAPL, NVDA", key="mon_search")
 
@@ -1610,16 +2171,14 @@ with tab_screener:
         batch_size=125
     )
 
-    if not univ_rows:
-        st.error(f"Could not load market data for {mon_universe}.")
-    else:
+    if univ_rows:
         full_univ_df = pd.DataFrame(univ_rows)
         custom_col_label = f"Exit: {mon_custom_exit_days}D RSI>{mon_custom_exit_thresh} ($)"
 
         sort_c1, sort_c2, sort_c3 = st.columns([1.6, 1.0, 1.8])
         with sort_c1:
             default_sort_col = st.selectbox(
-                "Sort Universe By Column (or click any column header below):",
+                "Sort Universe By Column:",
                 options=list(full_univ_df.columns),
                 index=list(full_univ_df.columns).index(f"{mon_b_days}D RSI(2)"),
                 key="mon_sort_col"
@@ -1635,7 +2194,6 @@ with tab_screener:
             )
 
         display_univ_df = full_univ_df.copy()
-
         if mon_search.strip():
             q_tokens = [t.strip().upper() for t in re.split(r'[, \n]+', mon_search) if t.strip()]
             display_univ_df = display_univ_df[display_univ_df["Ticker"].isin(q_tokens)]
@@ -1648,42 +2206,24 @@ with tab_screener:
         asc_bool = ("Ascending" in sort_dir)
         display_univ_df = display_univ_df.sort_values(by=default_sort_col, ascending=asc_bool, na_position='last').reset_index(drop=True)
 
-        s_m1, s_m2, s_m3, s_m4 = st.columns(4)
-        s_m1.metric("Tickers Displayed", f"{len(display_univ_df)} / {len(full_univ_df)}")
-        s_m2.metric("Oversold (2D RSI ≤ 20)", f"{int((full_univ_df['2D RSI(2)'] <= 20).sum())}")
-        s_m3.metric("Oversold (5D RSI ≤ 20)", f"{int((full_univ_df['5D RSI(2)'] <= 20).sum())}")
-        s_m4.metric("Above 200-Day SMA", f"{(full_univ_df['% vs 200 SMA'] > 0).mean() * 100:.1f}%")
-
         st.dataframe(
             display_univ_df,
             column_config=get_snapshot_column_config(custom_col_label),
             hide_index=True,
             use_container_width=True,
-            height=640
-        )
-
-        st.download_button(
-            label=f"📥 Download {mon_universe} RSI & Exit Price Table ({len(display_univ_df)} Tickers CSV)",
-            data=display_univ_df.to_csv(index=False).encode('utf-8'),
-            file_name=f"{univ_key.lower().replace(' ', '_')}_exit_prices.csv",
-            mime="text/csv"
+            height=620
         )
 
 # ----------------------------------------------------
-# TAB 3: CUSTOM WATCHLIST & EXIT PRICES
+# TAB 4: CUSTOM WATCHLIST & EXIT PRICES
 # ----------------------------------------------------
 with tab_watchlist:
     st.subheader("📋 Custom Watchlist — Current RSI Readings & Target Exit Prices")
-    st.caption(
-        "Enter your personal list of tickers to view their current 1D/2D/3D/5D RSI(2) readings and all exact target exit prices ($). "
-        "Every column is sortable by clicking its header."
-    )
-
     w_c1, w_c2, w_c3, w_c4 = st.columns([2.2, 1.0, 1.0, 1.0])
     with w_c1:
         w_input = st.text_input(
             "Watchlist Tickers (comma or space separated)",
-            value="SPY, QQQ, IWM, DIA, META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AMD",
+            value=", ".join(DEFAULT_LS_BASKET),
             key="w_tickers_input"
         )
     with w_c2:
@@ -1695,10 +2235,7 @@ with tab_watchlist:
         w_cx_thresh = st.selectbox("Custom Exit Threshold", RSI_THRESHOLDS, index=6, format_func=lambda x: f"RSI > {x}", key="w_cx_thresh")
 
     w_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', w_input) if s.strip()]))
-
-    if not w_list:
-        st.warning("Please enter at least one valid ticker symbol.")
-    else:
+    if w_list:
         w_rows = load_universe_snapshots_batched(
             w_list,
             active_rsi_days=w_b_days,
@@ -1706,37 +2243,23 @@ with tab_watchlist:
             custom_exit_thresh=w_cx_thresh,
             batch_size=100
         )
-
-        if not w_rows:
-            st.error("Could not retrieve sufficient trading history for the entered ticker(s).")
-        else:
+        if w_rows:
             watch_df = pd.DataFrame(w_rows)
             w_custom_col = f"Exit: {w_cx_days}D RSI>{w_cx_thresh} ($)"
             watch_df = watch_df.sort_values(by=f"{w_b_days}D RSI(2)", ascending=True).reset_index(drop=True)
-
             st.dataframe(
                 watch_df,
                 column_config=get_snapshot_column_config(w_custom_col),
                 hide_index=True,
                 use_container_width=True,
-                height=480
-            )
-            st.download_button(
-                label="📥 Download Watchlist Exit Prices (CSV)",
-                data=watch_df.to_csv(index=False).encode('utf-8'),
-                file_name="watchlist_exit_prices.csv",
-                mime="text/csv"
+                height=500
             )
 
 # ----------------------------------------------------
-# TAB 4: MULTI-STOCK PORTFOLIO BACKTESTER
+# TAB 5: MULTI-STOCK LONG-ONLY PORTFOLIO BACKTESTER
 # ----------------------------------------------------
 with tab_portfolio:
     st.subheader("Multi-Stock Portfolio Backtester (Next-Open Execution)")
-    st.caption(
-        "Simulates a portfolio across a universe or custom basket: Entry & Exit signals evaluated at Close → Orders executed at Next Day's Open."
-    )
-
     p_col1, p_col2, p_col3 = st.columns([1.3, 1.4, 1.3])
     with p_col1:
         port_source = st.radio("Universe Mode", ["Index Universe", "Custom Ticker List"], horizontal=True)
@@ -1744,7 +2267,7 @@ with tab_portfolio:
         if port_source == "Index Universe":
             port_univ = st.selectbox("Select Universe", ["Major ETFs", "Dow Jones 30", "Nasdaq 100", "S&P 500", "Russell 2000 (Small Caps)"], index=1)
         else:
-            port_custom = st.text_input("Tickers (comma-separated)", value="META, NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, AMD, AVGO, NFLX")
+            port_custom = st.text_input("Tickers (comma-separated)", value=", ".join(DEFAULT_LS_BASKET))
     with p_col3:
         port_pool_limit = st.selectbox("Max Universe Candidates", ["Top 50 Liquid", "Top 100 Liquid", "Top 250 Liquid", "Full Universe"], index=1)
 
@@ -1788,13 +2311,11 @@ with tab_portfolio:
         else:
             tickers_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_custom) if s.strip()]))
 
-        if not tickers_list or not port_buckets:
-            st.warning("Please select at least one ticker and one entry bucket.")
-        else:
+        if tickers_list and port_buckets:
             with st.spinner(f"Downloading data and simulating Next-Open portfolio across {len(tickers_list)} ticker(s)..."):
                 s_p = (datetime.now() - timedelta(days=port_years * 365)).strftime('%Y-%m-%d')
                 e_p = datetime.now().strftime('%Y-%m-%d')
-                bulk_p = yf.download(tickers_list, start=s_p, end=e_p, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+                bulk_p = fetch_bulk_history_cached(tuple(tickers_list), s_p, e_p)
 
                 prep_dict = {}
                 for sym in tickers_list:
@@ -1804,9 +2325,7 @@ with tab_portfolio:
                         if not p_df.empty:
                             prep_dict[sym] = p_df
 
-            if not prep_dict:
-                st.error("Could not load sufficient data for the selected tickers.")
-            else:
+            if prep_dict:
                 p_yr_df, p_eq_df, p_tr_df = run_portfolio_backtest_next_open(
                     prepared_dfs=prep_dict,
                     selected_buckets=port_buckets,
@@ -1829,12 +2348,3 @@ with tab_portfolio:
                     k6.metric("Max Drawdown", f"{ov['Max Drawdown (%)']:.1f}%")
 
                     st.dataframe(p_yr_df, use_container_width=True)
-
-                    fig_eq = go.Figure()
-                    fig_eq.add_trace(go.Scatter(x=p_eq_df.index, y=p_eq_df['Equity'], mode='lines', line=dict(color='#00E676', width=2), name='Equity'))
-                    fig_eq.update_layout(title="Portfolio Equity Curve ($)", template="plotly_dark", height=360, margin=dict(l=20, r=20, t=40, b=20))
-                    st.plotly_chart(fig_eq, use_container_width=True)
-
-                    if not p_tr_df.empty:
-                        with st.expander(f"View Portfolio Trade Log ({len(p_tr_df)} Closed Trades)"):
-                            st.dataframe(p_tr_df.sort_values(by="Exit Date (Open)", ascending=False), use_container_width=True)
