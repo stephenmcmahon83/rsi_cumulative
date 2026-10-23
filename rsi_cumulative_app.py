@@ -9,12 +9,12 @@ import requests
 import io
 import re
 
-st.set_page_config(page_title="RSI(2) Next-Open Backtester & L/S Engine", layout="wide")
+st.set_page_config(page_title="RSI(2) Next-Open & Limit Backtester", layout="wide")
 
-st.title("RSI(2) Quantitative Backtester & Long/Short Basket Engine")
+st.title("RSI(2) Quantitative Backtester (Next-Open & Limit-Below-Open Engine)")
 st.caption(
-    "Execution Model: Entry Signal on Close → Execute Next Day Open | "
-    "Exit Signal on Close → Execute Next Day Open"
+    "Execution Model: Entry Signal on Close → Buy at Next Day Open (0%) or Limit X% Below Next Open (1%–7%) | "
+    "Exit Signal on Close → Sell Next Day Open"
 )
 
 # ==========================================
@@ -33,6 +33,7 @@ BUCKET_LABELS = [
 ]
 RSI_THRESHOLDS = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 HIGH_CLOSE_WINDOWS = [3, 5, 7, 10]
+LIMIT_DISCOUNT_OPTIONS = [0, 1, 2, 3, 4, 5, 6, 7]
 
 EXIT_KEYS = (
     ["SMA5"]
@@ -47,6 +48,9 @@ RSI_DAYS_MAP = {
     "3-Day RSI(2)": 3,
     "5-Day RSI(2)": 5
 }
+
+def format_limit_label(pct):
+    return "At Next Day's Open (0%)" if pct == 0 else f"Limit {pct}% Below Next Open"
 
 def get_exit_label_map(rsi_name="5-Day RSI(2)"):
     mapping = {
@@ -306,36 +310,31 @@ def run_long_short_basket_backtest(
     require_pre_exit_side=True,
     max_long_rsi=100.0,
     min_short_rsi=0.0,
-    max_hold_days=20
+    max_hold_days=20,
+    entry_limit_pct=0.0
 ):
     """
     Backtests buying the ETF with the lowest X-day RSI(2) and shorting the ETF with the highest X-day RSI(2).
-    - Signals evaluated at Yesterday's Close (prev_d) -> Executed at Today's Open (d).
-    - Long Exit: Close > SMA(5) -> Sell at Next Open.
-    - Short Exit: Close < SMA(5) -> Cover at Next Open.
-    Tracks 3 independent accounts to provide clean attribution:
-      1. Combined Long/Short Portfolio (50% Long allocation / 50% Short allocation, rebalanced on new entries)
-      2. Long-Only Leg Portfolio (100% allocation to Lowest RSI ETF)
-      3. Short-Only Leg Portfolio (100% allocation to Highest RSI ETF)
+    Supports Market-on-Open (0%) or Limit X% Better than Next Open:
+      - Long Limit Price = Next_Open * (1 - entry_limit_pct / 100); fills if Low[d] <= Limit Price.
+      - Short Limit Price = Next_Open * (1 + entry_limit_pct / 100); fills if High[d] >= Limit Price.
     """
     if not etf_dfs:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # Common trading calendar across available ETFs
     all_dates = sorted(list(set.union(*[set(df.index) for df in etf_dfs.values()])))
     if len(all_dates) < 10:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     rsi_col = f"RSI2_{rsi_days}d"
 
-    # Separate equity tracking for Long-Only, Short-Only, and Combined 50/50 L/S
     long_eq = float(initial_capital)
     short_eq = float(initial_capital)
     comb_long_cap = float(initial_capital) * 0.5
     comb_short_cap = float(initial_capital) * 0.5
 
-    long_pos = None   # dict: ticker, signal_date, entry_date, entry_open, days_held, leg_cap, comb_cap
-    short_pos = None  # dict: ticker, signal_date, entry_date, entry_open, days_held, leg_cap, comb_cap
+    long_pos = None
+    short_pos = None
 
     trades = []
     equity_records = []
@@ -365,7 +364,7 @@ def run_long_short_basket_backtest(
                     exit_reason = f"Max Hold ({max_hold_days}d)"
 
                 if exit_long:
-                    ret_pct = (today_open - long_pos['entry_open']) / long_pos['entry_open'] * 100.0
+                    ret_pct = (today_open - long_pos['entry_px']) / long_pos['entry_px'] * 100.0
                     long_eq = long_pos['leg_cap'] * (1.0 + ret_pct / 100.0)
                     comb_long_cap = long_pos['comb_cap'] * (1.0 + ret_pct / 100.0)
 
@@ -374,8 +373,9 @@ def run_long_short_basket_backtest(
                         "Ticker": t_long,
                         "Signal Date": long_pos['signal_date'].strftime('%Y-%m-%d'),
                         "Signal RSI": round(long_pos['signal_rsi'], 1),
-                        "Entry Date (Open)": long_pos['entry_date'].strftime('%Y-%m-%d'),
-                        "Entry Open ($)": round(long_pos['entry_open'], 2),
+                        "Entry Date": long_pos['entry_date'].strftime('%Y-%m-%d'),
+                        "Next Open ($)": round(long_pos['next_open'], 2),
+                        "Entry Fill ($)": round(long_pos['entry_px'], 2),
                         "Exit Date (Open)": d.strftime('%Y-%m-%d'),
                         "Exit Open ($)": round(today_open, 2),
                         "Exit Reason": exit_reason,
@@ -404,8 +404,7 @@ def run_long_short_basket_backtest(
                     exit_reason = f"Max Hold ({max_hold_days}d)"
 
                 if exit_short:
-                    # Short return: profit when exit_open < entry_open; clamp loss at -100%
-                    raw_short_ret = (short_pos['entry_open'] - today_open) / short_pos['entry_open'] * 100.0
+                    raw_short_ret = (short_pos['entry_px'] - today_open) / short_pos['entry_px'] * 100.0
                     ret_pct = max(-100.0, raw_short_ret)
                     short_eq = short_pos['leg_cap'] * (1.0 + ret_pct / 100.0)
                     comb_short_cap = short_pos['comb_cap'] * (1.0 + ret_pct / 100.0)
@@ -415,8 +414,9 @@ def run_long_short_basket_backtest(
                         "Ticker": t_short,
                         "Signal Date": short_pos['signal_date'].strftime('%Y-%m-%d'),
                         "Signal RSI": round(short_pos['signal_rsi'], 1),
-                        "Entry Date (Open)": short_pos['entry_date'].strftime('%Y-%m-%d'),
-                        "Entry Open ($)": round(short_pos['entry_open'], 2),
+                        "Entry Date": short_pos['entry_date'].strftime('%Y-%m-%d'),
+                        "Next Open ($)": round(short_pos['next_open'], 2),
+                        "Entry Fill ($)": round(short_pos['entry_px'], 2),
                         "Exit Date (Open)": d.strftime('%Y-%m-%d'),
                         "Exit Open ($)": round(today_open, 2),
                         "Exit Reason": exit_reason,
@@ -427,20 +427,18 @@ def run_long_short_basket_backtest(
                     })
                     short_pos = None
 
-        # If both legs are flat at the Open, rebalance the 50/50 combined capital buckets
         if long_pos is None and short_pos is None:
             total_comb_cash = comb_long_cap + comb_short_cap
             comb_long_cap = total_comb_cash * 0.5
             comb_short_cap = total_comb_cash * 0.5
 
         # --------------------------------------------------
-        # STEP B: RANK ETFs AT YESTERDAY'S CLOSE (prev_d) -> ENTER AT TODAY'S OPEN (d)
+        # STEP B: RANK ETFs AT YESTERDAY'S CLOSE (prev_d) -> ENTER ON DAY (d)
         # --------------------------------------------------
         can_enter_long = (long_pos is None)
         can_enter_short = (short_pos is None)
 
         if "Synchronized" in execution_mode:
-            # Only open new positions when BOTH legs are flat
             if not (long_pos is None and short_pos is None):
                 can_enter_long = False
                 can_enter_short = False
@@ -450,7 +448,10 @@ def run_long_short_basket_backtest(
             for sym, df_sym in etf_dfs.items():
                 if prev_d in df_sym.index and d in df_sym.index:
                     p_row = df_sym.loc[prev_d]
-                    t_open = float(df_sym.loc[d, 'Open_Adj'])
+                    d_row = df_sym.loc[d]
+                    t_open = float(d_row['Open_Adj'])
+                    t_low = float(d_row['Low_Adj'])
+                    t_high = float(d_row['High_Adj'])
                     r_val = float(p_row[rsi_col])
                     c_val = float(p_row['Close_Adj'])
                     sma5_val = float(p_row['SMA_5'])
@@ -460,11 +461,12 @@ def run_long_short_basket_backtest(
                             "rsi": r_val,
                             "close": c_val,
                             "sma5": sma5_val,
-                            "next_open": t_open
+                            "next_open": t_open,
+                            "next_low": t_low,
+                            "next_high": t_high
                         })
 
             if len(valid_etfs) >= 2:
-                # Sort ascending by RSI(2)
                 valid_etfs.sort(key=lambda x: x['rsi'])
 
                 # 1. Select Lowest RSI(2) ETF for Long Leg
@@ -476,17 +478,20 @@ def run_long_short_basket_backtest(
                         and (short_pos is None or x['ticker'] != short_pos['ticker'])
                     ]
                     if long_candidates:
-                        pick_l = long_candidates[0]  # Lowest RSI
-                        long_pos = {
-                            "ticker": pick_l['ticker'],
-                            "signal_date": prev_d,
-                            "signal_rsi": pick_l['rsi'],
-                            "entry_date": d,
-                            "entry_open": pick_l['next_open'],
-                            "days_held": 0,
-                            "leg_cap": long_eq,
-                            "comb_cap": comb_long_cap
-                        }
+                        pick_l = long_candidates[0]
+                        target_l_px = pick_l['next_open'] * (1.0 - entry_limit_pct / 100.0)
+                        if entry_limit_pct <= 0.0 or pick_l['next_low'] <= target_l_px:
+                            long_pos = {
+                                "ticker": pick_l['ticker'],
+                                "signal_date": prev_d,
+                                "signal_rsi": pick_l['rsi'],
+                                "entry_date": d,
+                                "next_open": pick_l['next_open'],
+                                "entry_px": target_l_px,
+                                "days_held": 0,
+                                "leg_cap": long_eq,
+                                "comb_cap": comb_long_cap
+                            }
 
                 # 2. Select Highest RSI(2) ETF for Short Leg
                 if can_enter_short:
@@ -497,24 +502,27 @@ def run_long_short_basket_backtest(
                         and (long_pos is None or x['ticker'] != long_pos['ticker'])
                     ]
                     if short_candidates:
-                        pick_s = short_candidates[0]  # Highest RSI
-                        short_pos = {
-                            "ticker": pick_s['ticker'],
-                            "signal_date": prev_d,
-                            "signal_rsi": pick_s['rsi'],
-                            "entry_date": d,
-                            "entry_open": pick_s['next_open'],
-                            "days_held": 0,
-                            "leg_cap": short_eq,
-                            "comb_cap": comb_short_cap
-                        }
+                        pick_s = short_candidates[0]
+                        target_s_px = pick_s['next_open'] * (1.0 + entry_limit_pct / 100.0)
+                        if entry_limit_pct <= 0.0 or pick_s['next_high'] >= target_s_px:
+                            short_pos = {
+                                "ticker": pick_s['ticker'],
+                                "signal_date": prev_d,
+                                "signal_rsi": pick_s['rsi'],
+                                "entry_date": d,
+                                "next_open": pick_s['next_open'],
+                                "entry_px": target_s_px,
+                                "days_held": 0,
+                                "leg_cap": short_eq,
+                                "comb_cap": comb_short_cap
+                            }
 
         # --------------------------------------------------
         # STEP C: MARK-TO-MARKET EQUITY AT CLOSE OF DAY (d)
         # --------------------------------------------------
         if long_pos is not None and d in etf_dfs[long_pos['ticker']].index:
             cur_c = float(etf_dfs[long_pos['ticker']].loc[d, 'Close_Adj'])
-            l_ret = (cur_c - long_pos['entry_open']) / long_pos['entry_open']
+            l_ret = (cur_c - long_pos['entry_px']) / long_pos['entry_px']
             mtm_long_only = long_pos['leg_cap'] * (1.0 + l_ret)
             mtm_comb_long = long_pos['comb_cap'] * (1.0 + l_ret)
         else:
@@ -523,7 +531,7 @@ def run_long_short_basket_backtest(
 
         if short_pos is not None and d in etf_dfs[short_pos['ticker']].index:
             cur_c = float(etf_dfs[short_pos['ticker']].loc[d, 'Close_Adj'])
-            s_ret = max(-1.0, (short_pos['entry_open'] - cur_c) / short_pos['entry_open'])
+            s_ret = max(-1.0, (short_pos['entry_px'] - cur_c) / short_pos['entry_px'])
             mtm_short_only = short_pos['leg_cap'] * (1.0 + s_ret)
             mtm_comb_short = short_pos['comb_cap'] * (1.0 + s_ret)
         else:
@@ -543,9 +551,6 @@ def run_long_short_basket_backtest(
     if equity_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # --------------------------------------------------
-    # STEP D: YEAR-BY-YEAR SUMMARY & PER-TICKER ATTRIBUTION
-    # --------------------------------------------------
     equity_df['Year'] = equity_df.index.year
     yearly_rows = []
 
@@ -584,7 +589,6 @@ def run_long_short_basket_backtest(
             "Combined Max DD (%)": round(c_dd, 1)
         })
 
-    # Overall All-Years Row
     tot_c_ret = ((equity_df['Combined_Equity'].iloc[-1] / initial_capital) - 1.0) * 100.0
     tot_l_ret = ((equity_df['Long_Only_Equity'].iloc[-1] / initial_capital) - 1.0) * 100.0
     tot_s_ret = ((equity_df['Short_Only_Equity'].iloc[-1] / initial_capital) - 1.0) * 100.0
@@ -620,7 +624,6 @@ def run_long_short_basket_backtest(
 
     yearly_df = pd.DataFrame(yearly_rows).set_index("Year")
 
-    # Per-Ticker Attribution Table
     ticker_attr_rows = []
     if not trades_df.empty:
         for sym in sorted(etf_dfs.keys()):
@@ -803,7 +806,14 @@ def get_snapshot_column_config(custom_col_name):
         "% vs 200 SMA": st.column_config.NumberColumn("% vs 200 SMA", format="%+.2f%%")
     }
 
-def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
+def prepare_stock_data(raw_df, rsi_days=5, max_hold=20, entry_discount_pct=0.0):
+    """
+    Computes adjusted OHLC, N-day RSI(2) buckets, and Next-Open / Limit-Below-Open
+    forward trade outcomes for all exit strategies.
+    - When entry_discount_pct == 0: enters unconditionally at Open[i+1].
+    - When entry_discount_pct > 0: places a limit order at Open[i+1] * (1 - entry_discount_pct/100)
+      and fills if and only if Low[i+1] <= Limit Price.
+    """
     df = normalize_ohlcv_df(raw_df)
     if df.empty:
         return pd.DataFrame()
@@ -857,12 +867,27 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
     day_arrays = {k: np.full(n, np.nan) for k in EXIT_KEYS}
     mae_arrays = {k: np.full(n, np.nan) for k in EXIT_KEYS}
     exit_idx_arrays = {k: np.full(n, -1, dtype=int) for k in EXIT_KEYS}
+    entry_px_arr = np.full(n, np.nan)
+    filled_arr = np.zeros(n, dtype=bool)
+
+    discount_mult = 1.0 - (float(entry_discount_pct) / 100.0)
 
     for i in range(n - 2):
         ent_idx = i + 1
-        entry_px = o_vals[ent_idx]
-        if np.isnan(entry_px) or entry_px <= 0:
+        next_open_px = o_vals[ent_idx]
+        next_low_px = l_vals[ent_idx]
+        if np.isnan(next_open_px) or next_open_px <= 0 or np.isnan(next_low_px):
             continue
+
+        target_entry_px = next_open_px * discount_mult
+
+        # Check if limit order at X% below Open[i+1] fills during Day i+1
+        if entry_discount_pct > 0.0 and next_low_px > target_entry_px:
+            continue
+
+        entry_px = target_entry_px
+        entry_px_arr[i] = entry_px
+        filled_arr[i] = True
 
         max_k = min(max_hold, n - 2 - i)
         if max_k < 1:
@@ -914,7 +939,10 @@ def prepare_stock_data(raw_df, rsi_days=5, max_hold=20):
         if i + 11 < n:
             record_exit("FIX10", 10)
 
-    new_cols = {}
+    new_cols = {
+        'Entry_Px': entry_px_arr,
+        'Limit_Filled': filled_arr
+    }
     for k in EXIT_KEYS:
         new_cols[f'Ret_{k}'] = ret_arrays[k]
         new_cols[f'Days_{k}'] = day_arrays[k]
@@ -1046,7 +1074,9 @@ def build_candlestick_and_rsi_chart(df, ticker, lookback_bars=126):
     return fig
 
 def filter_signal_rows(df, require_uptrend=True, fresh_only=False):
-    data = df.dropna(subset=['Bucket']).copy()
+    # Exclude the final row of df if it doesn't have at least 1 forward trading bar
+    valid_window = df.iloc[:-2].copy() if len(df) > 2 else df.copy()
+    data = valid_window.dropna(subset=['Bucket']).copy()
     if require_uptrend:
         data = data[data['Above_200SMA'] == True]
     if fresh_only:
@@ -1071,12 +1101,16 @@ def build_bucket_table(filtered_df, exit_key):
     rows = []
     for b in BUCKET_LABELS:
         sub = filtered_df[filtered_df['Bucket'] == b]
+        sig_count = len(sub)
         n, wr, avg_r, pf, days, mae = summarize_series(
             sub[f'Ret_{exit_key}'], sub[f'Days_{exit_key}'], sub[f'MAE_{exit_key}']
         )
+        fill_rate = round((n / sig_count) * 100.0, 1) if sig_count > 0 else 0.0
         rows.append({
             "Entry Bucket": b,
-            "Trades": n,
+            "Signals": int(sig_count),
+            "Filled Trades": n,
+            "Fill Rate (%)": fill_rate,
             "Win Rate (%)": wr,
             "Avg Return (%)": avg_r,
             "Profit Factor": pf,
@@ -1085,16 +1119,52 @@ def build_bucket_table(filtered_df, exit_key):
         })
     return pd.DataFrame(rows).set_index("Entry Bucket")
 
+def build_limit_offset_comparison_table(raw_df, rsi_days, selected_buckets, exit_key, require_uptrend=True, fresh_only=False):
+    """
+    Compares entering at Next Day's Open (0%) vs. Limit 1%, 2%, 3%, 4%, 5%, 6%, and 7% Below Next Open
+    for the active Entry Bucket(s) and Exit Rule.
+    """
+    rows = []
+    for pct in LIMIT_DISCOUNT_OPTIONS:
+        prep = prepare_stock_data(raw_df, rsi_days=rsi_days, entry_discount_pct=float(pct))
+        filt = filter_signal_rows(prep, require_uptrend=require_uptrend, fresh_only=fresh_only)
+        sub = filt[filt['Bucket'].astype(str).isin(selected_buckets)]
+        sig_count = len(sub)
+        n, wr, avg_r, pf, days, mae = summarize_series(
+            sub[f'Ret_{exit_key}'], sub[f'Days_{exit_key}'], sub[f'MAE_{exit_key}']
+        )
+        fill_rate = round((n / sig_count) * 100.0, 1) if sig_count > 0 else 0.0
+        valid_rets = sub[f'Ret_{exit_key}'].dropna()
+        comp_ret = ((1.0 + valid_rets / 100.0).prod() - 1.0) * 100.0 if n > 0 else 0.0
+
+        rows.append({
+            "Entry Execution Level": format_limit_label(pct),
+            "Signals": int(sig_count),
+            "Filled Trades": n,
+            "Fill Rate (%)": fill_rate,
+            "Win Rate (%)": wr,
+            "Avg Return (%)": avg_r,
+            "Profit Factor": pf,
+            "Compounded Return (%)": round(comp_ret, 2),
+            "Avg Hold (Days)": days,
+            "Avg Drawdown (%)": mae
+        })
+    return pd.DataFrame(rows).set_index("Entry Execution Level")
+
 def build_exit_comparison_table(filtered_df, selected_buckets, exit_label_map):
     sub = filtered_df[filtered_df['Bucket'].astype(str).isin(selected_buckets)]
+    sig_count = len(sub)
     rows = []
     for k in EXIT_KEYS:
         n, wr, avg_r, pf, days, mae = summarize_series(
             sub[f'Ret_{k}'], sub[f'Days_{k}'], sub[f'MAE_{k}']
         )
+        fill_rate = round((n / sig_count) * 100.0, 1) if sig_count > 0 else 0.0
         rows.append({
             "Exit Strategy (Next Open)": exit_label_map[k],
-            "Trades": n,
+            "Signals": int(sig_count),
+            "Filled Trades": n,
+            "Fill Rate (%)": fill_rate,
             "Win Rate (%)": wr,
             "Avg Return (%)": avg_r,
             "Profit Factor": pf,
@@ -1107,7 +1177,10 @@ def build_entry_exit_matrix(filtered_df, metric_choice, exit_label_map):
     rows = []
     for b in BUCKET_LABELS:
         sub = filtered_df[filtered_df['Bucket'] == b]
-        row_dict = {"Entry Bucket": b, "Trades": int(sub['Ret_SMA5'].dropna().shape[0])}
+        row_dict = {
+            "Entry Bucket": b,
+            "Filled Trades": int(sub['Ret_SMA5'].dropna().shape[0])
+        }
         for k in EXIT_KEYS:
             n, wr, avg_r, pf, days, _ = summarize_series(
                 sub[f'Ret_{k}'], sub[f'Days_{k}'], sub[f'MAE_{k}']
@@ -1127,7 +1200,8 @@ def build_entry_exit_matrix(filtered_df, metric_choice, exit_label_map):
     return pd.DataFrame(rows).set_index("Entry Bucket")
 
 def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
-    sub = filtered_df[filtered_df['Bucket'].astype(str).isin(selected_buckets)].dropna(subset=[f'Ret_{exit_key}']).copy()
+    sub_all_sigs = filtered_df[filtered_df['Bucket'].astype(str).isin(selected_buckets)].copy()
+    sub = sub_all_sigs.dropna(subset=[f'Ret_{exit_key}']).copy()
     if sub.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -1142,12 +1216,15 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
         if ex_loc <= ent_loc or ex_loc >= len(full_df):
             continue
 
+        entry_fill_px = float(row['Entry_Px']) if pd.notna(row['Entry_Px']) else float(opens[ent_loc])
+
         trade_rows.append({
             "Signal Date (Close)": sig_date.strftime('%Y-%m-%d'),
             "Entry Bucket": str(row['Bucket']),
             "Signal RSI": round(row['Active_RSI'], 1),
-            "Entry Date (Open)": dates[ent_loc].strftime('%Y-%m-%d'),
-            "Entry Open ($)": round(opens[ent_loc], 2),
+            "Entry Date": dates[ent_loc].strftime('%Y-%m-%d'),
+            "Next Open ($)": round(opens[ent_loc], 2),
+            "Entry Fill ($)": round(entry_fill_px, 2),
             "Exit Signal (Close)": dates[ex_loc - 1].strftime('%Y-%m-%d'),
             "Exit Date (Open)": dates[ex_loc].strftime('%Y-%m-%d'),
             "Exit Open ($)": round(opens[ex_loc], 2),
@@ -1161,16 +1238,23 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
     if trades_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
+    sub_all_sigs['Year'] = sub_all_sigs.index.year
+    sigs_by_year = sub_all_sigs.groupby('Year').size().to_dict()
+
     yearly_rows = []
     for yr, grp in trades_df.groupby('Year'):
         ret_s = grp['Return (%)']
+        n_filled = len(grp)
+        n_sigs = sigs_by_year.get(yr, n_filled)
         gains = ret_s[ret_s > 0].sum()
         losses = abs(ret_s[ret_s < 0].sum())
         pf = round(gains / losses, 2) if losses > 0 else (99.0 if gains > 0 else np.nan)
         comp_ret = ((1 + ret_s / 100.0).prod() - 1) * 100.0
         yearly_rows.append({
             "Year": str(yr),
-            "Trades": int(len(grp)),
+            "Signals": int(n_sigs),
+            "Filled Trades": int(n_filled),
+            "Fill Rate (%)": round((n_filled / n_sigs) * 100.0, 1) if n_sigs > 0 else 0.0,
             "Win Rate (%)": round((ret_s > 0).mean() * 100.0, 1),
             "Avg Return (%)": round(ret_s.mean(), 2),
             "Profit Factor": pf,
@@ -1183,10 +1267,14 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
     all_losses = abs(all_ret[all_ret < 0].sum())
     all_pf = round(all_gains / all_losses, 2) if all_losses > 0 else np.nan
     all_comp = ((1 + all_ret / 100.0).prod() - 1) * 100.0
+    tot_sigs = len(sub_all_sigs)
+    tot_filled = len(trades_df)
 
     yearly_rows.append({
         "Year": "All Years",
-        "Trades": int(len(trades_df)),
+        "Signals": int(tot_sigs),
+        "Filled Trades": int(tot_filled),
+        "Fill Rate (%)": round((tot_filled / tot_sigs) * 100.0, 1) if tot_sigs > 0 else 0.0,
         "Win Rate (%)": round((all_ret > 0).mean() * 100.0, 1),
         "Avg Return (%)": round(all_ret.mean(), 2),
         "Profit Factor": all_pf,
@@ -1203,7 +1291,8 @@ def build_yearly_and_trades(full_df, filtered_df, selected_buckets, exit_key):
 def run_portfolio_backtest_next_open(
     prepared_dfs, selected_buckets, exit_key, exit_label,
     max_positions=5, initial_capital=100000.0,
-    require_uptrend=True, fresh_entry_only=True
+    require_uptrend=True, fresh_entry_only=True,
+    entry_discount_pct=0.0
 ):
     all_dates = sorted(list(set.union(*[set(df.index) for df in prepared_dfs.values()])))
     if len(all_dates) < 3:
@@ -1213,6 +1302,7 @@ def run_portfolio_backtest_next_open(
     open_positions = {}
     trade_log = []
     daily_equity_records = []
+    discount_mult = 1.0 - (float(entry_discount_pct) / 100.0)
 
     for idx in range(1, len(all_dates)):
         d = all_dates[idx]
@@ -1258,8 +1348,9 @@ def run_portfolio_backtest_next_open(
                 trade_log.append({
                     "Ticker": ticker,
                     "Signal Date (Close)": pos['signal_date'].strftime('%Y-%m-%d'),
-                    "Entry Date (Open)": pos['entry_date'].strftime('%Y-%m-%d'),
-                    "Entry Open ($)": round(pos['entry_price'], 2),
+                    "Entry Date": pos['entry_date'].strftime('%Y-%m-%d'),
+                    "Next Open ($)": round(pos['next_open'], 2),
+                    "Entry Fill ($)": round(pos['entry_price'], 2),
                     "Exit Date (Open)": d.strftime('%Y-%m-%d'),
                     "Exit Open ($)": round(today_open, 2),
                     "Exit Rule": exit_label,
@@ -1294,13 +1385,19 @@ def run_portfolio_backtest_next_open(
                     if prev_loc > 0 and str(df.iloc[prev_loc - 1]['Bucket']) == prev_bucket:
                         continue
 
-                today_open = df.loc[d, 'Open_Adj']
-                if pd.isna(today_open) or today_open <= 0:
+                today_open = float(df.loc[d, 'Open_Adj'])
+                today_low = float(df.loc[d, 'Low_Adj'])
+                if pd.isna(today_open) or today_open <= 0 or pd.isna(today_low):
                     continue
+
+                limit_px = today_open * discount_mult
+                filled_today = (entry_discount_pct <= 0.0) or (today_low <= limit_px)
 
                 candidates.append({
                     "ticker": ticker,
-                    "entry_open": today_open,
+                    "next_open": today_open,
+                    "entry_px": limit_px,
+                    "filled": filled_today,
                     "rsi_val": prev_row['Active_RSI']
                 })
 
@@ -1314,15 +1411,19 @@ def run_portfolio_backtest_next_open(
 
             target_slot_size = current_equity / max_positions
 
+            # Place limit orders on top available_slots candidates; fill those whose Low reached Limit Price
             for cand in candidates[:available_slots]:
+                if not cand['filled']:
+                    continue
                 invest_amt = min(cash, target_slot_size)
                 if invest_amt >= 250.0:
-                    shares = invest_amt / cand['entry_open']
+                    shares = invest_amt / cand['entry_px']
                     cash -= invest_amt
                     open_positions[cand['ticker']] = {
                         'signal_date': prev_d,
                         'entry_date': d,
-                        'entry_price': cand['entry_open'],
+                        'next_open': cand['next_open'],
+                        'entry_price': cand['entry_px'],
                         'shares': shares,
                         'days_held': 0
                     }
@@ -1603,11 +1704,11 @@ tab_ls, tab_study, tab_screener, tab_watchlist, tab_portfolio = st.tabs([
 with tab_ls:
     st.subheader("⚖️ Long Lowest RSI(2) / Short Highest RSI(2) Basket Backtester")
     st.caption(
-        "Strategy Rules: Rank all basket ETFs at the Close → Buy the ETF with the Lowest X-Day RSI(2) at Next Open (Exit when Close > 5D SMA) | "
-        "Short the ETF with the Highest X-Day RSI(2) at Next Open (Cover when Close < 5D SMA)."
+        "Strategy Rules: Rank all basket ETFs at the Close → Buy the ETF with the Lowest X-Day RSI(2) (Exit when Close > 5D SMA) | "
+        "Short the ETF with the Highest X-Day RSI(2) (Cover when Close < 5D SMA)."
     )
 
-    ls_c1, ls_c2, ls_c3 = st.columns([2.2, 1.1, 0.9])
+    ls_c1, ls_c2, ls_c3, ls_c4 = st.columns([2.0, 1.0, 1.2, 0.8])
     with ls_c1:
         ls_tickers_input = st.text_input(
             "ETF Basket Tickers (comma or space separated)",
@@ -1616,17 +1717,26 @@ with tab_ls:
         )
     with ls_c2:
         ls_rsi_choice = st.selectbox(
-            "Primary X-Day RSI(2) Lookback",
+            "Primary X-Day RSI(2)",
             ["1-Day RSI(2)", "2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"],
             index=1,
             key="ls_rsi_lookback"
         )
         ls_rsi_days = RSI_DAYS_MAP[ls_rsi_choice]
     with ls_c3:
-        ls_years = st.number_input("Backtest History (Years)", min_value=2, max_value=20, value=10, key="ls_years")
-
-    ls_c4, ls_c5, ls_c6, ls_c7 = st.columns([1.4, 1.1, 1.1, 1.0])
+        ls_limit_pct = st.selectbox(
+            "Entry Execution (Open vs. Limit)",
+            LIMIT_DISCOUNT_OPTIONS,
+            index=0,
+            format_func=lambda x: "At Next Open (0%)" if x == 0 else f"Limit {x}% Better than Open",
+            help="0% enters at Next Open. 1%–7% places a Limit Buy X% below Next Open for Longs and a Limit Short X% above Next Open for Shorts.",
+            key="ls_limit_pct"
+        )
     with ls_c4:
+        ls_years = st.number_input("History (Years)", min_value=2, max_value=20, value=10, key="ls_years")
+
+    ls_c5, ls_c6, ls_c7, ls_c8 = st.columns([1.4, 1.1, 1.1, 1.0])
+    with ls_c5:
         ls_exec_mode = st.selectbox(
             "Leg Execution Mode",
             [
@@ -1636,28 +1746,24 @@ with tab_ls:
             index=0,
             key="ls_exec_mode"
         )
-    with ls_c5:
+    with ls_c6:
         ls_max_long_rsi = st.slider(
             "Max RSI(2) Allowed for Long Entry",
-            min_value=10, max_value=100, value=100, step=5,
-            help="Set to 100 to always buy the lowest RSI ETF, or lower (e.g. 30) to require an oversold reading."
-        )
-    with ls_c6:
-        ls_min_short_rsi = st.slider(
-            "Min RSI(2) Required for Short Entry",
-            min_value=0, max_value=90, value=0, step=5,
-            help="Set to 0 to always short the highest RSI ETF, or raise (e.g. 70) to require an overbought reading."
+            min_value=10, max_value=100, value=100, step=5
         )
     with ls_c7:
+        ls_min_short_rsi = st.slider(
+            "Min RSI(2) Required for Short Entry",
+            min_value=0, max_value=90, value=0, step=5
+        )
+    with ls_c8:
         ls_exclude_3x = st.checkbox(
             "Exclude 3x ETFs (SOXL, LABU, JNUG, GUSH)",
-            value=False,
-            help="Toggle to see performance with vs. without the 4 leveraged ETFs."
+            value=False
         )
         ls_pre_exit_check = st.checkbox(
             "Require Long < SMA5 & Short > SMA5",
-            value=True,
-            help="Ensures the Long candidate is currently below its 5-day SMA and the Short candidate is currently above its 5-day SMA on signal close."
+            value=True
         )
 
     ls_tickers = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', ls_tickers_input) if s.strip()]))
@@ -1682,9 +1788,6 @@ with tab_ls:
         if len(etf_dfs) < 2:
             st.error("Could not retrieve sufficient historical data for at least 2 ETFs in the basket.")
         else:
-            # --------------------------------------------------
-            # 1. CURRENT LIVE BASKET RANKING & NEXT-OPEN SIGNALS
-            # --------------------------------------------------
             live_rank_rows = []
             for sym, df_sym in etf_dfs.items():
                 last_r = df_sym.iloc[-1]
@@ -1737,12 +1840,8 @@ with tab_ls:
                 display_rank_df = rank_df.drop(columns=["Active_RSI"])
                 st.dataframe(display_rank_df, hide_index=True, use_container_width=True)
 
-            # --------------------------------------------------
-            # 2. COMPARE ALL X-DAY RSI(2) LOOKBACKS (1D, 2D, 3D, 5D)
-            # --------------------------------------------------
             st.divider()
             st.subheader("1. Compare X-Day RSI(2) Lookback Horizons (1D vs. 2D vs. 3D vs. 5D)")
-            st.caption("Side-by-side backtest comparison across all four RSI(2) smoothing lookbacks on this exact ETF basket.")
 
             comp_lookback_rows = []
             cached_runs = {}
@@ -1755,7 +1854,8 @@ with tab_ls:
                     require_pre_exit_side=ls_pre_exit_check,
                     max_long_rsi=float(ls_max_long_rsi),
                     min_short_rsi=float(ls_min_short_rsi),
-                    max_hold_days=20
+                    max_hold_days=20,
+                    entry_limit_pct=float(ls_limit_pct)
                 )
                 cached_runs[lb_days] = (y_df, eq_df, tr_df, attr_df)
                 if not y_df.empty:
@@ -1788,9 +1888,6 @@ with tab_ls:
                 }
                 st.dataframe(comp_lb_df, column_config=lb_cfg, use_container_width=True)
 
-            # --------------------------------------------------
-            # 3. DETAILED RESULTS FOR SELECTED X-DAY RSI(2)
-            # --------------------------------------------------
             ls_yearly_df, ls_equity_df, ls_trades_df, ls_attr_df = cached_runs[ls_rsi_days]
 
             if not ls_yearly_df.empty:
@@ -1806,7 +1903,6 @@ with tab_ls:
                 k5.metric("Profit Factor", f"{ov_sel['Profit Factor']}")
                 k6.metric("Combined Max DD", f"{ov_sel['Combined Max DD (%)']:.1f}%")
 
-                # Equity Curve Chart (Combined vs Long-Only vs Short-Only)
                 fig_ls_eq = go.Figure()
                 fig_ls_eq.add_trace(go.Scatter(
                     x=ls_equity_df.index, y=ls_equity_df['Combined_Equity'],
@@ -1835,7 +1931,6 @@ with tab_ls:
                 )
                 st.plotly_chart(fig_ls_eq, use_container_width=True)
 
-                # Year-by-Year Table & Per-Ticker Attribution
                 col_y_ls, col_attr_ls = st.columns([1.45, 1.35])
                 with col_y_ls:
                     st.markdown(f"##### 📅 Year-by-Year Results ({ls_rsi_choice})")
@@ -1879,12 +1974,12 @@ with tab_ls:
                     st.dataframe(ls_trades_df.sort_values(by="Exit Date (Open)", ascending=False), use_container_width=True)
 
 # ----------------------------------------------------
-# TAB 2: SINGLE TICKER STUDY (WITH CANDLESTICK & RSI SUBPLOTS)
+# TAB 2: SINGLE TICKER STUDY (WITH LIMIT ENTRY & CANDLESTICK CHART)
 # ----------------------------------------------------
 with tab_study:
     st.subheader("Strategy Configuration")
 
-    c1, c2, c3, c4 = st.columns([1.0, 1.3, 1.5, 0.9])
+    c1, c2, c3, c4, c5 = st.columns([0.9, 1.1, 1.35, 1.35, 0.8])
     with c1:
         study_ticker = st.text_input("Ticker Symbol", value="META", key="study_sym").upper().strip()
     with c2:
@@ -1894,27 +1989,37 @@ with tab_study:
             index=0
         )
     with c3:
+        study_limit_pct = st.selectbox(
+            "Entry Execution (Open vs. Limit)",
+            LIMIT_DISCOUNT_OPTIONS,
+            index=0,
+            format_func=format_limit_label,
+            help="Select 0% to enter at the Next Day's Open, or 1%–7% to enter on a Limit Order set X% below the Next Day's Open (fills only if Next Day's Low <= Limit Price).",
+            key="study_limit_pct"
+        )
+    with c4:
         signal_mode = st.selectbox(
             "Entry Signal Counting",
             ["All Days in Bucket", "First Day Entering Bucket Only (No Overlap)"],
             index=0
         )
-    with c4:
+    with c5:
         years_back = st.number_input("History (Years)", min_value=1, max_value=30, value=20)
 
     active_rsi_days = RSI_DAYS_MAP[rsi_choice]
     exit_label_map = get_exit_label_map(rsi_choice)
     inv_exit_label_map = {v: k for k, v in exit_label_map.items()}
+    active_entry_label = format_limit_label(study_limit_pct)
 
-    c5, c6, c7 = st.columns([1.6, 1.6, 1.2])
-    with c5:
+    c6, c7, c8 = st.columns([1.6, 1.6, 1.2])
+    with c6:
         selected_exit_label = st.selectbox(
             "Exit Rule (Executed on Next Day's Open)",
             list(exit_label_map.values()),
             index=0
         )
         active_exit_key = inv_exit_label_map[selected_exit_label]
-    with c6:
+    with c7:
         bucket_preset = st.selectbox(
             "Entry Bucket(s) for Deep-Dive & Yearly Table",
             [
@@ -1933,7 +2038,7 @@ with tab_study:
             ],
             index=0
         )
-    with c7:
+    with c8:
         st.write("")
         require_uptrend_study = st.checkbox("Require Close > 200-Day SMA", value=True)
 
@@ -1954,7 +2059,11 @@ with tab_study:
     if raw_df is None or len(raw_df) < 220:
         st.error(f"Insufficient history found for '{study_ticker}' (minimum 220 trading days required).")
     else:
-        processed_df = prepare_stock_data(raw_df, rsi_days=active_rsi_days)
+        processed_df = prepare_stock_data(
+            raw_df,
+            rsi_days=active_rsi_days,
+            entry_discount_pct=float(study_limit_pct)
+        )
         fresh_only = ("First Day" in signal_mode)
         filtered_df = filter_signal_rows(processed_df, require_uptrend=require_uptrend_study, fresh_only=fresh_only)
 
@@ -2004,14 +2113,19 @@ with tab_study:
         )
         st.plotly_chart(fig_candles, use_container_width=True)
 
+        # ==========================================
+        # SECTION 1: ENTRY BUCKET BREAKDOWN
+        # ==========================================
         st.divider()
-        st.subheader(f"1. Performance by Entry Bucket — Exit: {selected_exit_label} (Next Open)")
+        st.subheader(f"1. Performance by Entry Bucket — Entry: {active_entry_label} | Exit: {selected_exit_label}")
         bucket_table = build_bucket_table(filtered_df, active_exit_key)
 
-        col_tbl, col_charts = st.columns([1.35, 1.65])
+        col_tbl, col_charts = st.columns([1.45, 1.55])
         with col_tbl:
             b_cfg = {
-                "Trades": st.column_config.NumberColumn(format="%d"),
+                "Signals": st.column_config.NumberColumn(format="%d"),
+                "Filled Trades": st.column_config.NumberColumn(format="%d"),
+                "Fill Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                 "Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
                 "Avg Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
                 "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
@@ -2032,7 +2146,7 @@ with tab_study:
             ))
             fig_b.add_hline(y=0, line_dash="dash", line_color="white")
             fig_b.update_layout(
-                title=f"Avg Trade Return (%) by {rsi_choice} Entry Bucket (Exit: {selected_exit_label})",
+                title=f"Avg Return (%) by {rsi_choice} Bucket ({active_entry_label})",
                 template="plotly_dark",
                 yaxis_title="Avg Return (%)",
                 xaxis_title=f"{rsi_choice} Entry Bucket",
@@ -2041,9 +2155,44 @@ with tab_study:
             )
             st.plotly_chart(fig_b, use_container_width=True)
 
+        # ==========================================
+        # SECTION 2: LIMIT ENTRY COMPARISON (0% vs 1%..7% BELOW NEXT OPEN)
+        # ==========================================
         st.divider()
         bucket_title_str = ", ".join(active_buckets) if len(active_buckets) <= 3 else "All 10 Buckets"
-        st.subheader(f"2. Compare All Exit Rules — Entry Bucket(s): {bucket_title_str}")
+        st.subheader(f"2. Limit Order Entry Comparison (0% Open vs. 1%–7% Below Next Open) — Bucket(s): {bucket_title_str}")
+        st.caption(
+            f"Compares entering at the Next Day's Open (0%) against placing a Limit Buy Order 1% to 7% below the Next Day's Open "
+            f"(Exit: **{selected_exit_label}**)."
+        )
+
+        limit_comp_df = build_limit_offset_comparison_table(
+            raw_df=raw_df,
+            rsi_days=active_rsi_days,
+            selected_buckets=active_buckets,
+            exit_key=active_exit_key,
+            require_uptrend=require_uptrend_study,
+            fresh_only=fresh_only
+        )
+
+        lim_cfg = {
+            "Signals": st.column_config.NumberColumn(format="%d"),
+            "Filled Trades": st.column_config.NumberColumn(format="%d"),
+            "Fill Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+            "Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
+            "Avg Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
+            "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+            "Compounded Return (%)": st.column_config.NumberColumn(format="%+,.2f%%"),
+            "Avg Hold (Days)": st.column_config.NumberColumn(format="%.1f d"),
+            "Avg Drawdown (%)": st.column_config.NumberColumn(format="%.2f%%")
+        }
+        st.dataframe(limit_comp_df, column_config=lim_cfg, use_container_width=True)
+
+        # ==========================================
+        # SECTION 3: EXIT STRATEGY COMPARISON
+        # ==========================================
+        st.divider()
+        st.subheader(f"3. Compare All Exit Rules — Entry: {active_entry_label} | Bucket(s): {bucket_title_str}")
 
         sub_tab1, sub_tab2 = st.tabs([
             f"📋 Exit Comparison Table (Entry: {bucket_title_str})",
@@ -2067,23 +2216,30 @@ with tab_study:
                     "%.2f" if grid_metric == "Profit Factor" else "%.1f d"
                 )
             )
-            mat_cfg = {"Trades": st.column_config.NumberColumn(format="%d")}
+            mat_cfg = {"Filled Trades": st.column_config.NumberColumn(format="%d")}
             for k in EXIT_KEYS:
                 mat_cfg[exit_label_map[k]] = st.column_config.NumberColumn(format=fmt_str)
 
             st.dataframe(matrix_df, column_config=mat_cfg, use_container_width=True)
 
+        # ==========================================
+        # SECTION 4: YEAR-BY-YEAR & TRADE LOG
+        # ==========================================
         st.divider()
-        st.subheader(f"3. Year-by-Year Breakdown — Entry: {bucket_title_str} | Exit: {selected_exit_label}")
+        st.subheader(
+            f"4. Year-by-Year Breakdown — Bucket(s): {bucket_title_str} | Entry: {active_entry_label} | Exit: {selected_exit_label}"
+        )
         yearly_df, trades_df = build_yearly_and_trades(processed_df, filtered_df, active_buckets, active_exit_key)
 
         if yearly_df.empty:
-            st.info("No historical trades matched the selected filters.")
+            st.info("No historical trades filled under the selected limit and bucket filters.")
         else:
-            y_col1, y_col2 = st.columns([1.3, 1.7])
+            y_col1, y_col2 = st.columns([1.4, 1.6])
             with y_col1:
                 y_cfg = {
-                    "Trades": st.column_config.NumberColumn(format="%d"),
+                    "Signals": st.column_config.NumberColumn(format="%d"),
+                    "Filled Trades": st.column_config.NumberColumn(format="%d"),
+                    "Fill Rate (%)": st.column_config.NumberColumn(format="%.1f%%"),
                     "Win Rate (%)": st.column_config.ProgressColumn(format="%.1f%%", min_value=0, max_value=100),
                     "Avg Return (%)": st.column_config.NumberColumn(format="%+.2f%%"),
                     "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
@@ -2102,7 +2258,7 @@ with tab_study:
                 ))
                 fig_yr.add_hline(y=0, line_dash="dash", line_color="white")
                 fig_yr.update_layout(
-                    title=f"{study_ticker} Annual Compounded Return (%) by Year",
+                    title=f"{study_ticker} Annual Compounded Return (%) by Year ({active_entry_label})",
                     template="plotly_dark",
                     yaxis_title="Compounded Return (%)",
                     xaxis_title="Year",
@@ -2111,7 +2267,13 @@ with tab_study:
                 )
                 st.plotly_chart(fig_yr, use_container_width=True)
 
-            with st.expander(f"🔎 View Individual Trade Audit Log ({len(trades_df)} Trades)"):
+            with st.expander(f"🔎 View Individual Trade Audit Log ({len(trades_df)} Filled Trades — {active_entry_label})"):
+                st.download_button(
+                    label="Download Trade Log (CSV)",
+                    data=trades_df.to_csv(index=False).encode('utf-8'),
+                    file_name=f"{study_ticker}_{rsi_choice}_limit_{study_limit_pct}pct_trades.csv",
+                    mime="text/csv"
+                )
                 st.dataframe(trades_df.sort_values(by="Signal Date (Close)", ascending=False), use_container_width=True)
 
 # ----------------------------------------------------
@@ -2259,7 +2421,7 @@ with tab_watchlist:
 # TAB 5: MULTI-STOCK LONG-ONLY PORTFOLIO BACKTESTER
 # ----------------------------------------------------
 with tab_portfolio:
-    st.subheader("Multi-Stock Portfolio Backtester (Next-Open Execution)")
+    st.subheader("Multi-Stock Portfolio Backtester (Next-Open & Limit-Below-Open)")
     p_col1, p_col2, p_col3 = st.columns([1.3, 1.4, 1.3])
     with p_col1:
         port_source = st.radio("Universe Mode", ["Index Universe", "Custom Ticker List"], horizontal=True)
@@ -2271,7 +2433,7 @@ with tab_portfolio:
     with p_col3:
         port_pool_limit = st.selectbox("Max Universe Candidates", ["Top 50 Liquid", "Top 100 Liquid", "Top 250 Liquid", "Full Universe"], index=1)
 
-    p_c4, p_c5, p_c6, p_c7 = st.columns([1.1, 1.3, 1.5, 0.9])
+    p_c4, p_c5, p_c6, p_c7, p_c7b = st.columns([1.0, 1.2, 1.3, 1.3, 0.7])
     with p_c4:
         port_rsi_choice = st.selectbox("RSI(2) Lookback", ["2-Day RSI(2)", "3-Day RSI(2)", "5-Day RSI(2)"], index=0, key="p_rsi")
         port_rsi_days = RSI_DAYS_MAP[port_rsi_choice]
@@ -2280,9 +2442,17 @@ with tab_portfolio:
     with p_c5:
         port_buckets = st.multiselect("Target Entry Buckets", options=BUCKET_LABELS, default=['<10', '11-20'], key="p_buckets")
     with p_c6:
+        port_limit_pct = st.selectbox(
+            "Entry Execution (Open vs. Limit)",
+            LIMIT_DISCOUNT_OPTIONS,
+            index=0,
+            format_func=format_limit_label,
+            key="p_limit_pct"
+        )
+    with p_c7:
         port_exit_label = st.selectbox("Exit Rule (Next Open)", list(port_exit_map.values()), index=0, key="p_exit")
         port_exit_key = port_inv_exit_map[port_exit_label]
-    with p_c7:
+    with p_c7b:
         port_years = st.number_input("Years", min_value=2, max_value=25, value=10, key="p_yrs")
 
     p_c8, p_c9, p_c10, p_c11 = st.columns([1.0, 1.0, 1.2, 1.2])
@@ -2297,7 +2467,7 @@ with tab_portfolio:
         st.write("")
         port_fresh = st.checkbox("First Day in Bucket Only", value=True, key="p_fresh")
 
-    if st.button("🚀 Run Next-Open Portfolio Simulation", type="primary", use_container_width=True):
+    if st.button("🚀 Run Portfolio Simulation", type="primary", use_container_width=True):
         if port_source == "Index Universe":
             roster = get_universe_tickers(port_univ)
             if "50" in port_pool_limit:
@@ -2312,7 +2482,7 @@ with tab_portfolio:
             tickers_list = list(dict.fromkeys([s.strip().upper().replace('.', '-') for s in re.split(r'[, \n]+', port_custom) if s.strip()]))
 
         if tickers_list and port_buckets:
-            with st.spinner(f"Downloading data and simulating Next-Open portfolio across {len(tickers_list)} ticker(s)..."):
+            with st.spinner(f"Downloading data and simulating portfolio across {len(tickers_list)} ticker(s)..."):
                 s_p = (datetime.now() - timedelta(days=port_years * 365)).strftime('%Y-%m-%d')
                 e_p = datetime.now().strftime('%Y-%m-%d')
                 bulk_p = fetch_bulk_history_cached(tuple(tickers_list), s_p, e_p)
@@ -2321,7 +2491,11 @@ with tab_portfolio:
                 for sym in tickers_list:
                     d_sym = extract_symbol_daily(bulk_p, sym, len(tickers_list))
                     if len(d_sym) >= 220:
-                        p_df = prepare_stock_data(d_sym, rsi_days=port_rsi_days)
+                        p_df = prepare_stock_data(
+                            d_sym,
+                            rsi_days=port_rsi_days,
+                            entry_discount_pct=float(port_limit_pct)
+                        )
                         if not p_df.empty:
                             prep_dict[sym] = p_df
 
@@ -2334,7 +2508,8 @@ with tab_portfolio:
                     max_positions=int(port_max_pos),
                     initial_capital=float(port_capital),
                     require_uptrend=port_uptrend,
-                    fresh_entry_only=port_fresh
+                    fresh_entry_only=port_fresh,
+                    entry_discount_pct=float(port_limit_pct)
                 )
 
                 if not p_yr_df.empty:
@@ -2348,3 +2523,12 @@ with tab_portfolio:
                     k6.metric("Max Drawdown", f"{ov['Max Drawdown (%)']:.1f}%")
 
                     st.dataframe(p_yr_df, use_container_width=True)
+
+                    fig_eq = go.Figure()
+                    fig_eq.add_trace(go.Scatter(x=p_eq_df.index, y=p_eq_df['Equity'], mode='lines', line=dict(color='#00E676', width=2), name='Equity'))
+                    fig_eq.update_layout(title=f"Portfolio Equity Curve ($) — {format_limit_label(port_limit_pct)}", template="plotly_dark", height=360, margin=dict(l=20, r=20, t=40, b=20))
+                    st.plotly_chart(fig_eq, use_container_width=True)
+
+                    if not p_tr_df.empty:
+                        with st.expander(f"View Portfolio Trade Log ({len(p_tr_df)} Closed Trades)"):
+                            st.dataframe(p_tr_df.sort_values(by="Exit Date (Open)", ascending=False), use_container_width=True)
